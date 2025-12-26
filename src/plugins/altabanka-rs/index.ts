@@ -2,6 +2,7 @@ import { Account, ScrapeFunc, Transaction } from '../../types/zenmoney'
 import { Preferences } from './types'
 import { convertAccounts, convertTransaction } from './converters'
 import { altaBankaApi } from './api'
+import { deduplicateTransactions } from './transactions'
 
 export const scrape: ScrapeFunc<Preferences> = async ({ preferences, fromDate, toDate, isInBackground }) => {
   await altaBankaApi.login(preferences, isInBackground)
@@ -28,7 +29,7 @@ export const scrape: ScrapeFunc<Preferences> = async ({ preferences, fromDate, t
 
         page++
 
-        transactions.push(...apiTransactions.map(t => convertTransaction(t, account)))
+        transactions.push(...apiTransactions.map(t => convertTransaction(t, account)).filter((tx): tx is Transaction => tx !== null))
       }
     }
 
@@ -45,13 +46,13 @@ export const scrape: ScrapeFunc<Preferences> = async ({ preferences, fromDate, t
 
         page++
 
-        transactions.push(...apiCardTransactions.map(t => convertTransaction(t, account, true)))
+        transactions.push(...apiCardTransactions.map(t => convertTransaction(t, account, true)).filter((tx): tx is Transaction => tx !== null))
       }
     }
   }))
 
   return {
     accounts: convertedAccounts,
-    transactions
+    transactions: deduplicateTransactions(transactions)
   }
 }

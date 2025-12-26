@@ -91,7 +91,7 @@ function convertDebitCard (apiAccount: unknown, blockations: unknown): Converted
       }
       const arrayHoldTransactions = getArray(card, 'blockedMovements')
       for (const arrayHoldTransaction of arrayHoldTransactions) {
-        if (arrayHoldTransaction && (instrument === getString(arrayHoldTransaction, 'blockedCurrency'))) {
+        if (arrayHoldTransaction != null && (instrument === getString(arrayHoldTransaction, 'blockedCurrency'))) {
           const arrayTransaction = convertBlockedMovementTransaction(arrayHoldTransaction, { id: coreAccountId.toString(), instrument })
           const balanceHoldTransaction = getNumber(arrayTransaction, 'movements[0].sum')
           balanceHoldTransactions = balanceHoldTransactions + balanceHoldTransaction
@@ -140,7 +140,7 @@ function convertCreditCard (apiAccount: unknown, blockations: unknown, creditCar
       }
       const arrayHoldTransactions = getArray(card, 'blockedMovements')
       for (const arrayHoldTransaction of arrayHoldTransactions) {
-        if (arrayHoldTransaction && (instrument === getString(arrayHoldTransaction, 'blockedCurrency'))) {
+        if (arrayHoldTransaction != null && (instrument === getString(arrayHoldTransaction, 'blockedCurrency'))) {
           const arrayTransaction = convertBlockedMovementTransaction(arrayHoldTransaction, { id: coreAccountId.toString(), instrument })
           const balanceHoldTransaction = getNumber(arrayTransaction, 'movements[0].sum')
           balanceHoldTransactions = balanceHoldTransactions + balanceHoldTransaction
@@ -339,7 +339,7 @@ function parseOuterTransfer (transaction: Transaction, apiTransaction: unknown, 
         }
       : {
           instrument: account.instrument,
-          sum: -transaction.movements[0].sum!
+          sum: -(transaction.movements[0].sum ?? 0)
         }
     transaction.movements.push({
       id: null,
@@ -361,12 +361,18 @@ export function convertTransaction (apiTransaction: unknown, product: ConvertedP
   const movementDate: number | undefined = getOptNumber(apiTransaction, 'movementDate')
   const groupKeys = []
   if (movementDate !== undefined) {
-    if (getNumber(apiTransaction, 'depositAmount') === 0 && getNumber(apiTransaction, 'withdrawnDepositAmount') === 0) {
+    if (getNumber(apiTransaction, 'depositAmount') === 0 &&
+      getNumber(apiTransaction, 'withdrawnDepositAmount') === 0 &&
+      getNumber(apiTransaction, 'interestedAmount') === 0) {
       return null
     }
     const date = new Date(getNumber(apiTransaction, 'movementDate'))
     const instrument = product.account.instrument
-    const sum = getNumber(apiTransaction, 'depositAmount') > 0 ? getNumber(apiTransaction, 'depositAmount') : -getNumber(apiTransaction, 'withdrawnDepositAmount')
+    const sum = getNumber(apiTransaction, 'depositAmount') > 0
+      ? getNumber(apiTransaction, 'depositAmount')
+      : getNumber(apiTransaction, 'withdrawnDepositAmount') > 0
+        ? -getNumber(apiTransaction, 'withdrawnDepositAmount')
+        : -getNumber(apiTransaction, 'interestedAmount')
     groupKeys.push(product.account.id)
     groupKeys.push(`${getNumber(apiTransaction, 'movementDate')}_${instrument}_${Math.abs(sum)}`)
     return {
@@ -435,7 +441,7 @@ function parseCashTransfer (transaction: ExtendedTransaction, apiTransaction: un
   const description = getString(apiTransaction, 'description')
   const subcategories = getOptArray(apiTransaction, 'subcategories')
   let categoryCode: string
-  if (subcategories) {
+  if (subcategories != null) {
     categoryCode = getString(subcategories[0], 'categoryCode')
   }
   // const subcategories: [] = getArray(apiTransaction, 'subcategories')
@@ -453,7 +459,7 @@ function parseCashTransfer (transaction: ExtendedTransaction, apiTransaction: un
         }
       : {
           instrument: product.account.instrument,
-          sum: -transaction.movements[0].sum!
+          sum: -(transaction.movements[0].sum ?? 0)
         }
     transaction.movements.push({
       id: null,

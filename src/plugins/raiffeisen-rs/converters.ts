@@ -84,9 +84,14 @@ export function convertCashTransaction (t1: GetAccountTransactionsResponse): Tra
       },
       {
         id: t1.TransactionID ?? null,
-        account: { type: AccountType.cash, instrument: t1.CurrencyCode, syncIds: null, company: null },
-        invoice,
-        sum: t1.DebitAmount - t1.CreditAmount,
+        account: {
+          type: AccountType.cash,
+          instrument: invoice === null ? t1.CurrencyCode : invoice.instrument,
+          syncIds: null,
+          company: null
+        },
+        invoice: null,
+        sum: invoice === null ? t1.DebitAmount - t1.CreditAmount : -invoice.sum,
         fee: 0
       }
     ],
@@ -108,7 +113,7 @@ function makeInvoice (t: GetAccountTransactionsResponse): Amount | null {
     details?.c_CurrencyCode_tx?.length > 0 &&
     details?.c_CurrencyCode_tx !== details?.s_CurrencyCode
     ? {
-        sum: isRefund ? details.c_Amount_tx! : -details.c_Amount_tx!,
+        sum: isRefund ? (details.c_Amount_tx ?? 0) : -(details.c_Amount_tx ?? 0),
         instrument: details.c_CurrencyCode_tx
       }
     : null
@@ -173,7 +178,7 @@ export function convertTransactionInProgress (transaction: string[], accountNumb
         fee: 0
       }
     ],
-    merchant: description != null
+    merchant: description != null && description !== ''
       ? {
           fullTitle: description,
           mcc: null,

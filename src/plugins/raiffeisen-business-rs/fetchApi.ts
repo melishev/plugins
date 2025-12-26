@@ -57,7 +57,7 @@ export async function getTicket ({ login, password }: Preferences): Promise<Auth
       headers: { 'set-cookie': true },
       body: true
     }
-  }) as FetchResponse & { body: AuthTicket}
+  }) as FetchResponse & { body: AuthTicket }
 
   if (response.body == null || response.body.length === 0) {
     throw new InvalidLoginOrPasswordError()
@@ -94,7 +94,7 @@ export async function getLegalEntities (ticket: AuthTicket): Promise<LegalEntiti
   if (!response.body.Success) {
     let message = ''
     if (response.body.UserTempBlocked != null) {
-      message = `User is temporarily blocked for ${response.body.TempBlockPeriodInMinutes} minutes`
+      message = `User is temporarily blocked for ${response.body.TempBlockPeriodInMinutes ?? 'null'} minutes`
     }
     throw new InvalidLoginOrPasswordError(message)
   }
@@ -109,7 +109,7 @@ export async function setLegalEntity (legalEntityId: string, lastSuccessfulLogon
       authenticationType: 'UsernamePassword',
       gridName: 'LegalEntityPreviewFlat',
       loginCertificateID: '',
-      multipleUser: true,
+      multipleUser: false,
       lastSuccessfulLogon,
       legalEntityId,
       ticket

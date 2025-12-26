@@ -20,7 +20,7 @@ function convertAccount (apiAccount: OtpAccount, accountsByCba: Record<string, C
   const balance = apiAccount.balance
   let newAccount = false
   let account = accountsByCba[cba]
-  if (!account) {
+  if (account == null) {
     account = {
       products: [],
       account: {
@@ -106,7 +106,7 @@ function parseMerchant (title: string, merchantTitle: unknown = null): Merchant 
   }
 
   const [merchantName, location] = title.split('/')
-  if (location !== '') {
+  if (location != null && location !== '') {
     return {
       title: merchantName.trim(),
       city: location.trim(),

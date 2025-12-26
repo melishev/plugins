@@ -1,8 +1,10 @@
-const currency = {
-  rur: 'RUB',
-  usd: 'USD',
-  eur: 'EUR',
-  gbp: 'GBP'
+function parseInstrument (instrument) {
+  switch (instrument) {
+    case 'rur':
+      return 'RUB'
+    default:
+      return instrument.toUpperCase()
+  }
 }
 
 export function convertAccounts ({ accounts, deposits, credits }) {
@@ -19,7 +21,7 @@ export function convertAccounts ({ accounts, deposits, credits }) {
         id: String(account.id),
         title: account.displayTitle,
         syncIds: cardPan(account),
-        instrument: currency[account.currencyIsoCode],
+        instrument: parseInstrument(account.currencyIsoCode),
         type: 'ccard',
         balance: parseFloat(account.balance),
         creditLimit: parseFloat(account.loanAmount) !== 0 ? parseFloat(account.loanAmount) : 0
@@ -29,7 +31,7 @@ export function convertAccounts ({ accounts, deposits, credits }) {
         id: String(account.id),
         title: account.displayTitle,
         syncIds: cardPan(account),
-        instrument: currency[account.currencyIsoCode],
+        instrument: parseInstrument(account.currencyIsoCode),
         type: 'ccard',
         balance: parseFloat(account.creditAmount) > 0 ? parseFloat(account.creditAmount) * (-1) : parseFloat(account.balance),
         creditLimit: parseFloat(account.loanAmount) !== 0 ? parseFloat(account.loanAmount) : 0
@@ -47,7 +49,7 @@ export function convertAccounts ({ accounts, deposits, credits }) {
         id: String(account.id),
         title: account.displayTitle,
         syncIds: cardPan(account),
-        instrument: currency[account.currencyIsoCode],
+        instrument: parseInstrument(account.currencyIsoCode),
         type: 'deposit',
         balance: parseFloat(account.balance),
         creditLimit: parseFloat(account.loanAmount) !== 0 ? parseFloat(account.loanAmount) : 0,
@@ -78,7 +80,7 @@ export function convertAccounts ({ accounts, deposits, credits }) {
         id: String(account.id),
         title: account.displayTitle,
         syncIds: cardPan(account),
-        instrument: currency[account.currencyIsoCode],
+        instrument: parseInstrument(account.currencyIsoCode),
         type: 'loan',
         balance: parseFloat(account.balance),
         creditLimit: parseFloat(account.loanAmount),
@@ -141,7 +143,7 @@ function findCredit (its, id) {
 export function convertTransaction (apiTransaction, account) {
   const invoice = {
     sum: parseFloat(apiTransaction.amount),
-    instrument: currency[apiTransaction.event.currencyIsoCode]
+    instrument: parseInstrument(apiTransaction.event.currencyIsoCode)
   }
   const fee = 0
   const transaction = {

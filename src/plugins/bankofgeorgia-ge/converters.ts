@@ -1,7 +1,20 @@
 import { Account, AccountType, ExtendedTransaction, Merchant, Movement, Amount } from '../../types/zenmoney'
 import { ConvertedAccount, ConvertedProduct, FetchedAccount, ConvertedLoan } from './models'
-import { getArray, getNumber, getOptNumber, getOptString, getString } from '../../types/get'
+import get, { getArray, getNumber, getOptNumber, getOptString, getString } from '../../types/get'
 import { getIntervalBetweenDates } from '../../common/momentDateUtils'
+
+function parseAmount (data: unknown, path: string): number {
+  const value = get(data, path)
+  if (typeof value === 'number') {
+    return value
+  }
+  if (typeof value === 'string') {
+    const parsed = parseFloat(value)
+    assert(!isNaN(parsed), `cant parse amount as number at "${path}" from `, data)
+    return parsed
+  }
+  assert(false, `cant get number at "${path}" from `, data)
+}
 
 export function getAmountFromDescription (description: string | undefined): Amount | null {
   if (description == null || description === undefined) {
@@ -29,14 +42,14 @@ function invertMovement (movement: Movement, account: Account, invertedAccount: 
   return {
     id: null,
     account:
-      invertedAccount.id != null
-        ? { id: invertedAccount.id }
-        : {
-            type: invertedAccount.type ?? null,
-            instrument: movement.invoice != null ? movement.invoice.instrument : account.instrument,
-            company: invertedAccount.companyId != null ? { id: invertedAccount.companyId } : null,
-            syncIds: null
-          },
+    invertedAccount.id != null
+      ? { id: invertedAccount.id }
+      : {
+          type: invertedAccount.type ?? null,
+          instrument: movement.invoice != null ? movement.invoice.instrument : account.instrument,
+          company: invertedAccount.companyId != null ? { id: invertedAccount.companyId } : null,
+          syncIds: null
+        },
     invoice: null,
     sum: sum != null ? -sum : null,
     fee: 0
@@ -146,25 +159,50 @@ function convertLoan (apiAccount: FetchedAccount): ConvertedLoan {
 export function convertTransaction (apiTransaction: unknown, product: ConvertedProduct): ExtendedTransaction | null {
   const printFormType = getString(apiTransaction, 'printFormType')
   const entryType = getString(apiTransaction, 'entryType')
-  const entryGroupDKey = getString(apiTransaction, 'entryGroupDKey')
+  // Handle both old API (entryGroupDKey) and new API (entryGroupDValue) field names
+  const entryGroupDKey = getOptString(apiTransaction, 'entryGroupDKey') ?? getOptString(apiTransaction, 'entryGroupDValue')
   const instrument = getString(apiTransaction, 'ccy')
-  let date = new Date(getNumber(apiTransaction, 'inpSysdate'))
-  if (getOptString(apiTransaction, 'authDateStr') !== undefined) {
-    const authDateStr = parseTransactionDate(getString(apiTransaction, 'authDateStr'))
+
+  // Handle date parsing for both old and new API formats
+  let date: Date
+  if (getOptString(apiTransaction, 'postDate') !== undefined) {
+    // New API format: uses ISO date string in postDate
+    date = new Date(getString(apiTransaction, 'postDate'))
+  } else {
+    // Old API format: uses timestamp in inpSysdate
+    date = new Date(getNumber(apiTransaction, 'inpSysdate'))
+  }
+
+  // Handle auth date for both formats
+  const authDateField = getOptString(apiTransaction, 'authDate') ?? getOptString(apiTransaction, 'authDateStr')
+  if (authDateField !== undefined) {
+    const authDateStr = parseTransactionDate(authDateField)
     if (authDateStr !== null) {
       date = new Date(authDateStr)
     }
   }
+
   assert(instrument === product.account.instrument, 'invoice tx found', apiTransaction)
+
+  // Handle transaction ID for both old and new API formats
+  let transactionId: string
+  if (getOptString(apiTransaction, 'entryId') !== undefined) {
+    // New API format: uses entryId
+    transactionId = getString(apiTransaction, 'entryId')
+  } else {
+    // Old API format: uses statmentId
+    transactionId = getNumber(apiTransaction, 'statmentId').toString()
+  }
+
   const transaction: ExtendedTransaction = {
     hold: getString(apiTransaction, 'status') === 'F',
     date,
     movements: [
       {
-        id: getNumber(apiTransaction, 'statmentId').toString(), // also there are entryId, docKey
+        id: transactionId,
         account: { id: product.account.id },
         invoice: null,
-        sum: -getNumber(apiTransaction, 'amount'),
+        sum: -parseAmount(apiTransaction, 'amount'),
         fee: 0
       }
     ],
@@ -173,21 +211,32 @@ export function convertTransaction (apiTransaction: unknown, product: ConvertedP
   }
 
   const cashAmount = getAmountFromDescription(getString(apiTransaction, 'nomination'))
+  const invoiceNeeded = !!((cashAmount != null) && cashAmount.instrument !== product.account.instrument)
 
   switch (printFormType) {
     case 'UTILITY_PAYMENT':
     case 'PAYMENT': {
       const title: string | undefined = getOptString(apiTransaction, 'merchantNameInt')
-      transaction.movements[0].invoice = cashAmount ? { sum: cashAmount.sum * getSignByPrintFormType(printFormType), instrument: cashAmount.instrument } : null
+      // Bank fees transaction contains original payment info in description, so we shouldn't parse it
+      if (entryGroupDKey !== 'text.entry.group.name.FEE' && invoiceNeeded) {
+        transaction.movements[0].invoice = invoiceNeeded
+          ? {
+              sum: cashAmount.sum * getSignByPrintFormType(printFormType),
+              instrument: cashAmount?.instrument
+            }
+          : null
+      }
       if (title !== undefined) {
         transaction.merchant = parseMerchant(title, getString(apiTransaction, 'nominationOriginal'))
+        transaction.comment = transaction.merchant !== null ? null : getOptString(apiTransaction, 'merchantName') ?? null
       } else {
         transaction.comment = getString(apiTransaction, 'nominationOriginal')
       }
       break
     }
     case 'OUT_TRANSFER':
-    case 'IN_TRANSFER': {
+    case 'IN_TRANSFER':
+    case 'OUT_INSTANT_TRANSFER': {
       switch (entryGroupDKey) {
         case 'text.entry.group.name.Currency.Exchange':
         case 'text.entry.group.name.Transfer':
@@ -206,8 +255,23 @@ export function convertTransaction (apiTransaction: unknown, product: ConvertedP
           transaction.movements.push(
             invertMovement(transaction.movements[0], product.account, { type: AccountType.ccard })
           )
-          if (getNumber(apiTransaction, 'statmentId') !== getNumber(apiTransaction, 'docKey')) {
-            transaction.groupKeys = [getNumber(apiTransaction, 'docKey').toString()]
+
+          // Handle groupKeys for both old and new API formats
+          let statementId: number | string
+          let docKeyId: number | string
+
+          if (getOptString(apiTransaction, 'entryId') !== undefined) {
+            // New API format
+            statementId = getString(apiTransaction, 'entryId')
+            docKeyId = getNumber(apiTransaction, 'docKey')
+          } else {
+            // Old API format
+            statementId = getNumber(apiTransaction, 'statmentId')
+            docKeyId = getNumber(apiTransaction, 'docKey')
+          }
+
+          if (statementId.toString() !== docKeyId.toString()) {
+            transaction.groupKeys = [docKeyId.toString()]
           }
         }
       }
@@ -218,7 +282,12 @@ export function convertTransaction (apiTransaction: unknown, product: ConvertedP
       if (title !== undefined) {
         transaction.merchant = parseMerchant(title, getString(apiTransaction, 'nominationOriginal'))
       }
-      transaction.movements[0].invoice = cashAmount ? { sum: cashAmount.sum * getSignByPrintFormType(printFormType), instrument: cashAmount.instrument } : null
+      transaction.movements[0].invoice = invoiceNeeded
+        ? {
+            sum: cashAmount.sum * getSignByPrintFormType(printFormType),
+            instrument: cashAmount.instrument
+          }
+        : null
       transaction.movements.push(
         invertMovement(transaction.movements[0], product.account, { type: AccountType.cash })
       )
@@ -236,7 +305,17 @@ export function convertTransaction (apiTransaction: unknown, product: ConvertedP
         transaction.comment = 'Cash withdrawal comission / ' + getString(apiTransaction, 'nominationOriginal')
       } else {
         transaction.comment = 'Cash withdrawal'
-        transaction.movements[0].invoice = cashAmount ? { sum: cashAmount.sum * getSignByPrintFormType(printFormType), instrument: cashAmount.instrument } : null
+        const txAmount = parseAmount(apiTransaction, 'amount')
+        if (cashAmount != null) {
+          if (cashAmount.instrument !== product.account.instrument) {
+            transaction.movements[0].invoice = { sum: -cashAmount.sum, instrument: cashAmount.instrument }
+            transaction.movements[0].sum = -txAmount
+          } else {
+            const fee = txAmount - cashAmount.sum
+            transaction.movements[0].sum = -(txAmount - fee)
+            transaction.movements[0].fee = fee !== 0 ? -Math.abs(Math.round(fee * 100) / 100) : 0
+          }
+        }
         transaction.movements.push(
           invertMovement(transaction.movements[0], product.account, { type: AccountType.cash })
         )
@@ -245,13 +324,14 @@ export function convertTransaction (apiTransaction: unknown, product: ConvertedP
     }
     case 'OTHER': {
       switch (entryGroupDKey) {
+        case 'text.entry.group.name.withdrawal':
         case 'text.entry.group.name.widthroval': {
           if (entryType === 'COM') { // cash withdrawal fee
             transaction.comment = 'cash withdrawal fee'
             break
           }
-          const txAmount = getNumber(apiTransaction, 'amount')
-          if (cashAmount) {
+          const txAmount = parseAmount(apiTransaction, 'amount')
+          if (cashAmount != null) {
             if (cashAmount.instrument !== product.account.instrument) {
               transaction.movements[0].invoice = { sum: -cashAmount.sum, instrument: cashAmount.instrument }
               transaction.movements[0].sum = -txAmount
@@ -313,6 +393,9 @@ export function convertTransaction (apiTransaction: unknown, product: ConvertedP
           transaction.groupKeys = [getNumber(apiTransaction, 'docKey').toString()]
           break
         }
+        case 'text.entry.group.name.Other':
+          transaction.groupKeys = [getNumber(apiTransaction, 'docKey').toString()]
+          break
         default:
           assert(false, 'new other entryGroupDKey found', entryGroupDKey, apiTransaction)
       }
@@ -341,7 +424,8 @@ function tryParseMcc (nominationOriginal: string): number | null {
   return parseInt(match[1])
 }
 
-function parseMerchant (merchantNameInt: string, nominationOriginal: string): Merchant {
+function parseMerchant (merchantNameInt: string, nominationOriginal: string): Merchant | null {
+  let merchant: Merchant | null = null
   const merchantTitle = merchantNameInt.split(',')
   let title = merchantTitle[0].trim()
   const country = merchantTitle.length === 1 || merchantTitle.length > 2 ? null : merchantTitle[1]?.trim()
@@ -351,11 +435,14 @@ function parseMerchant (merchantNameInt: string, nominationOriginal: string): Me
     city = titleCity[1] !== '' ? titleCity[1] : null
     title = titleCity[0]
   }
-  return {
-    country: country !== '' ? country : null,
-    city: city?.match(/\\+/) ? null : city,
-    title,
-    mcc: tryParseMcc(nominationOriginal),
-    location: null
+  if (title !== '') {
+    merchant = {
+      country: country !== '' ? country : null,
+      city: ((city?.match(/\\+/)) != null) ? null : city,
+      title,
+      mcc: tryParseMcc(nominationOriginal),
+      location: null
+    }
   }
+  return merchant
 }

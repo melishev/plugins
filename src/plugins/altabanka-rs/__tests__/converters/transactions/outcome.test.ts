@@ -2,6 +2,88 @@ import { convertTransaction } from '../../../converters'
 import { AccountInfo, AccountTransaction } from '../../../types'
 
 describe('convertTransaction', () => {
+  it.each([
+    [
+      {
+        id: 'id_%2FwwIaVbmrPpW4HthBRTaEpa4338%2BxX8LzSW2cXECXKqsr7O9hbmQFNvBR7ebFqbBWwJ70xQVoNjiU09SSMcK391PYRYXRz1c',
+        date: new Date('2025-03-06T00:00:00+03:00'),
+        address: 'VIP PAY*YANDEX.GO>TBILISI GE',
+        amount: -6.6,
+        currency: undefined,
+        description: ''
+      },
+      {
+        accountNumber: '0001000316640',
+        cardNumber: '',
+        id: '0001000316640',
+        name: 'Tekući račun',
+        currency: 'RSD',
+        balance: 23832.94
+      },
+      {
+        hold: false,
+        date: new Date('2025-03-06T00:00:00+03:00'),
+        movements: [
+          {
+            id: 'id_%2FwwIaVbmrPpW4HthBRTaEpa4338%2BxX8LzSW2cXECXKqsr7O9hbmQFNvBR7ebFqbBWwJ70xQVoNjiU09SSMcK391PYRYXRz1c',
+            account: { id: '0001000316640' },
+            sum: -6.6,
+            fee: 0,
+            invoice: null
+          }
+        ],
+        merchant: {
+          fullTitle: 'VIP PAY*YANDEX.GO>TBILISI GE',
+          mcc: null,
+          location: null
+        },
+        comment: null
+      }
+    ],
+    [
+      {
+        id: 'id_%2FwwIaVbmrPoMsBv0ky6QnO9%2FTCLfIPiP%2FFh5hhXFmXqB8PB6wyE6M73xrecLH5QsO%2BkKUUESRLz0WQo0jpSU7%2BOorJfH0%2FYL',
+        date: new Date('2025-08-14T00:00:00+03:00'),
+        address: 'SmartGlocal>Hong Kong HK',
+        amount: -5,
+        currency: 'EUR',
+        description: ''
+      },
+      {
+        accountNumber: '0001000316640',
+        cardNumber: '',
+        id: '0001000316640',
+        name: 'Tekući račun',
+        currency: 'RSD',
+        balance: 23832.94
+      },
+      {
+        hold: false,
+        date: new Date('2025-08-14T00:00:00+03:00'),
+        movements: [
+          {
+            id: 'id_%2FwwIaVbmrPoMsBv0ky6QnO9%2FTCLfIPiP%2FFh5hhXFmXqB8PB6wyE6M73xrecLH5QsO%2BkKUUESRLz0WQo0jpSU7%2BOorJfH0%2FYL',
+            account: { id: '0001000316640' },
+            invoice: {
+              sum: -5,
+              instrument: 'EUR'
+            },
+            sum: null,
+            fee: 0
+          }
+        ],
+        merchant: {
+          fullTitle: 'SmartGlocal>Hong Kong HK',
+          mcc: null,
+          location: null
+        },
+        comment: null
+      }
+    ]
+  ])('converts expense transaction', (apiTransaction, account, transaction) => {
+    expect(convertTransaction(apiTransaction, account)).toEqual(transaction)
+  })
+
   it('should convert basic transaction', () => {
     const accountTransaction: AccountTransaction = {
       date: new Date('2022-12-23T00:01:48.0000000+03:00'),
@@ -43,7 +125,7 @@ describe('convertTransaction', () => {
               "instrument": "TRY",
               "sum": -40.36,
             },
-            "sum": -40.36,
+            "sum": null,
           },
         ],
       }
@@ -90,7 +172,7 @@ describe('convertTransaction', () => {
               "instrument": "USD",
               "sum": -2,
             },
-            "sum": -2,
+            "sum": null,
           },
         ],
       }

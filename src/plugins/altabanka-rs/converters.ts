@@ -1,4 +1,4 @@
-import { AccountOrCard, AccountType, Transaction } from '../../types/zenmoney'
+import { AccountOrCard, AccountType, ExtendedTransaction } from '../../types/zenmoney'
 import { AccountInfo, AccountTransaction } from './types'
 
 export function convertAccounts (apiAccounts: AccountInfo[]): AccountOrCard[] {
@@ -16,13 +16,23 @@ export function convertAccounts (apiAccounts: AccountInfo[]): AccountOrCard[] {
   })
 }
 
-export function convertTransaction (accountTransaction: AccountTransaction, account: AccountInfo, hold = false): Transaction {
-  let invoice = null
+export function convertTransaction (accountTransaction: AccountTransaction, account: AccountInfo, hold = false): ExtendedTransaction | null {
+  accountTransaction.currency = accountTransaction.currency === undefined
+    ? 'RSD'
+    : accountTransaction.currency
 
-  if (accountTransaction.currency !== account.currency) {
+  if (accountTransaction.amount === 0) {
+    return null
+  }
+  let invoice = {
+    sum: accountTransaction.amount,
+    instrument: accountTransaction.currency
+  }
+  const match = accountTransaction.description.match(/^([\d.]+)\s(\w{3})/)
+  if (match != null) {
     invoice = {
-      sum: accountTransaction.amount,
-      instrument: accountTransaction.currency
+      sum: accountTransaction.amount < 0 ? -parseFloat(match[1]) : parseFloat(match[1]),
+      instrument: match[2]
     }
   }
 
@@ -32,19 +42,44 @@ export function convertTransaction (accountTransaction: AccountTransaction, acco
     location: null
   }
 
-  return {
+  const transaction: ExtendedTransaction = {
     hold,
     date: accountTransaction.date,
     movements: [
       {
         id: accountTransaction.id,
         account: { id: account.id },
-        sum: accountTransaction.amount,
+        sum: invoice?.instrument !== account.currency ? null : accountTransaction.amount,
         fee: 0,
-        invoice
+        invoice: invoice?.instrument === account.currency ? null : invoice
       }
     ],
     merchant,
-    comment: accountTransaction.description
+    comment: accountTransaction.description !== '' && (match == null) ? accountTransaction.description : null
+  };
+  [
+    parseCashTransfer
+  ].some(parser => parser(transaction, accountTransaction, account, invoice))
+  return transaction
+}
+
+function parseCashTransfer (transaction: ExtendedTransaction, accountTransaction: AccountTransaction, account: AccountInfo, invoice: { sum: number, instrument: string }): boolean {
+  if ([
+    /ATM/
+  ].some(regexp => regexp.test(accountTransaction.address))) {
+    transaction.movements.push({
+      id: null,
+      account: {
+        company: null,
+        instrument: invoice.instrument,
+        syncIds: null,
+        type: AccountType.cash
+      },
+      invoice: null,
+      sum: -invoice.sum,
+      fee: 0
+    })
+    return true
   }
+  return false
 }

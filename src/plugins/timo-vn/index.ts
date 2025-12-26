@@ -7,7 +7,7 @@ import { generateRandomString } from '../../common/utils'
 export const scrape: ScrapeFunc<Preferences> = async ({ preferences, fromDate, toDate, isFirstRun }) => {
   toDate = toDate ?? new Date()
 
-  const appVersion = '254'
+  const appVersion = '293'
 
   if (isFirstRun) {
     const auth: Auth = {
@@ -40,7 +40,7 @@ export const scrape: ScrapeFunc<Preferences> = async ({ preferences, fromDate, t
         return
       }
       accounts.push(account)
-      const apiTransactions = await fetchTransactions(session, product, fromDate, toDate!)
+      const apiTransactions = await fetchTransactions(session, product, fromDate, toDate ?? new Date())
       for (const apiTransaction of apiTransactions) {
         transactions.push(convertTransaction(apiTransaction, account))
       }
