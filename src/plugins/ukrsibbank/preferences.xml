@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PreferenceScreen>
+    <EditTextPreference
+        key="login"
+        obligatory="true"
+        title="Номер телефону"
+        dialogTitle="Номер телефону"
+        dialogMessage="Формат: +380XXXXXXXXX"
+        inputType="phone"
+        positiveButtonText="ОК"
+        negativeButtonText="Скасувати"
+        summary="||{@s}"
+    />
+    <EditTextPreference
+        key="password"
+        obligatory="true"
+        inputType="textPassword"
+        title="Пароль від UKRSIB online"
+        dialogTitle="Пароль від UKRSIB online"
+        dialogMessage="Введіть пароль, який ви використовуєте для входу в застосунок UKRSIB online 2.0."
+        positiveButtonText="ОК"
+        negativeButtonText="Скасувати"
+        summary="||***********"
+    />
+    <EditTextPreference
+        key="startDate"
+        obligatory="true"
+        inputType="date"
+        title="З якої дати завантажувати операції"
+        defaultValue="2018-01-01T00:00:00.000Z"
+        dialogTitle="З якої дати завантажувати операції"
+        positiveButtonText="ОК"
+        negativeButtonText="Скасувати"
+        summary="|startDate|{@s}"
+    />
+</PreferenceScreen>

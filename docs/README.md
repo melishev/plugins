@@ -1,60 +1,26 @@
-## Table of contents
-- [First steps](README.md)
-- [Plugin TypeScript guidelines](guidelines.md)
-- [preferences.xml details](preferences.xml.md)
-- [ZenmoneyManifest.xml details](ZenmoneyManifest.xml.md)
-- [Useful plugin utils](utils.md)
-- [Transaction domain examples](transactionsExamples.md)
+# Plugin development documentation
 
-## First steps
+Start with the plugin type. Each branch has two routes: **develop a new plugin** and **investigate logs and improve an existing plugin**. Shared requirements are maintained in `master`.
 
-### Installation
-- ```git clone https://github.com/zenmoney/ZenPlugins.git```
-- We use yarn as a package manager. So just call it to download all dependencies ```yarn```.
-    - If you don't have yarn, just install it ```npm install --global yarn```.
-    - Of course, you should have nodejs (16+) and npm.
+## Plugin types
 
-### Useful commands
-- ```yarn start (PLUGIN NAME)```
-  - Start development server with simple UI for plugin.
-  So you can debug your code in browser.
-- ```yarn build (PLUGIN NAME)```
-  - Build plugin to one file bundle.
-- ```yarn test [PLUGIN NAME]```
-  - Run type-check, linter and tests.
-  - Can be used with plugin name to run tests only for this plugin.
-- ```jest [PLUGIN NAME]```
-  - Run tests.
-  - Can be used with plugin name to run tests only for this plugin.
+| Type | Purpose and source | Start here |
+| --- | --- | --- |
+| Account and transaction synchronization | `scrape` loads financial products and history from APIs, websites, public ledgers or selected statements; `src/plugins/` | [Scrape](plugins/scrape/README.md) |
+| Receipt retrieval and code preview | `fetchReceipt` retrieves a receipt; `parseReceiptCode` previews a code locally; plugins may implement either or both; `src/receiptFetchers/` | [Receipt fetchers](plugins/receipt-fetchers/README.md) |
 
-### Structure overview
-```
-├── docs // this documentation
-├── locales // localization for error messages
-├── scripts // various scripts for building & debugging
-└── src
-    ├── common // useful utilities
-    ├── types
-        ├── get.ts // lib for interacting with unknown data
-        ├── index.d.ts // ts types for ZenMoney global object
-        └── zenmoney.ts // domain types
-    ├── UI // react UI for browser debug server
-    └── plugins
-        └── [plugin name] // recomended plugin structure
-            ├── api.ts // scrape flow implementation
-            ├── converters.ts // converters from bank format to zenmoney
-            ├── fetchApi.ts // bank api calls implementation
-            ├── index.ts // entrypoint with scrape function
-            ├── models.ts // constants and shared data structures
-            ├── preferences.xml // structure of plugin settings
-            └── ZenmoneyManifest.xml // plugin description
-```
+## Shared sections
 
-### Creating a new plugin
-- Fork this repository.
-- To create a new plugin, simply copy the example plugin and change its name
-  to bank name + country code (eg. click-uz).
-- Update [preferences.xml](preferences.xml.md) and
-[ZenmoneyManifest.xml](ZenmoneyManifest.xml.md) according to your bank features.
-- Implement bank API and converters according to our [guidelines](guidelines.md).
-- Commit, push and create pull request!
+| Need | Start here |
+| --- | --- |
+| Sessions and storage, logging, errors, network APIs or architecture | [Shared plugin facilities](plugins/README.md) |
+| Obtain/read logs, sanitize diagnostics, interpret metrics or reproduce a problem | [Debugging](debugging/README.md) |
+| Repository layout, environment, tests, Git or documentation changes | [Repository work](project/README.md) |
+
+## Reading rules
+
+Follow the selected route, reading its required sections once. Read linked references only when their condition applies or a detail needs clarification; do not load the whole tree or unrelated plugin notes. Type-specific routes select domain rules; shared sections own common behavior.
+
+For code changes, also follow [code-change policies](project/README.md#code-changes). Before Git/hosting operations or documentation changes, use the corresponding [repository route](project/README.md).
+
+`MUST`/`MUST NOT` are mandatory. `SHOULD` is a default requiring a documented reason to depart from. `MAY` is optional. Scope and explicit exceptions take precedence over general wording. [Compatibility limitations](plugins/compatibility.md) record actual gaps; a requirement does not claim that every legacy plugin already complies.

@@ -16,8 +16,10 @@ const messageHandlers = {
     onSyncError(payload)
   },
 
-  ':commands/prompt-user-input': async function ({ payload: { message, options, correlationId }, reply }) {
-    const result = prompt(message)
+  ':commands/prompt-user-input': async function ({ payload: { message, options, correlationId }, reply, onUserInputRequest }) {
+    const result = onUserInputRequest
+      ? await onUserInputRequest({ message, options })
+      : prompt(message)
     reply({ type: ':events/received-user-input', payload: { result, correlationId } })
   },
 
@@ -115,10 +117,11 @@ function setCookie (cookie) {
 }
 
 export async function handleMessageFromWorker ({ event, ...rest }) {
+  const target = event.currentTarget
   const messageHandler = messageHandlers[event.data.type] || (() => console.warn('message', event.data.type, ' from worker was not handled', { event }))
   await messageHandler({
     payload: event.data.payload,
-    reply: (message) => event.target.postMessage(message),
+    reply: (message) => target.postMessage(message),
     ...rest
   })
 }

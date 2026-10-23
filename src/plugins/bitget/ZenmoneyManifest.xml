@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<provider>
+    <id>bitget</id>
+    <company>16199</company>
+    <description>Read-only Bitget wallets and paginated external transfers.</description>
+</provider>

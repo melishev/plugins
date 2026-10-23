@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<provider>
+    <id>altyn-wallet-ab</id>
+    <company>16192</company>
+    <description>Синхронизация баланса и истории операций кошелька Altyn Wallet (lk.altyn.in) по токену.</description>
+    <codeRequired>false</codeRequired>
+</provider>

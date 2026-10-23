@@ -1,19 +1,39 @@
+import '../../polyfills/url'
 import { defaultsDeep } from 'lodash'
 import forge from 'node-forge'
 import { stringify } from 'querystring'
 import { getByteStringFromString } from '../../common/byteStringUtils'
 import { toISODateString } from '../../common/dateUtils'
-import { fetchJson } from '../../common/network'
+import { fetch as fetchText, fetchJson } from '../../common/network'
 import { generateUUID } from '../../common/utils'
-import { BankMessageError, InvalidLoginOrPasswordError, InvalidOtpCodeError, TemporaryUnavailableError } from '../../errors'
+import { BankMessageError, InvalidLoginOrPasswordError, InvalidOtpCodeError, InvalidPreferencesError, TemporaryUnavailableError } from '../../errors'
 
-const host = 'digital.bps-sberbank.by'
+const host = 'digital.sber-bank.by'
+const apiBaseUrl = `https://${host}/SBOLServer`
+const authBaseUrl = `https://${host}/api/v1/auth`
+const internalAuthHost = 'sbol-auth.apps.k8s-prom1.belpsb.by'
+const internalAuthRootHosts = [internalAuthHost, 'sbol-api-gateway.apps.k8s-prom1.belpsb.by']
+const authRedirectUri = `https://${host}/loginsbol`
+const appVersion = '4.1.10'
+const sbolClientId = 'sbol-client'
+const sbolClientSecret = 'BzKFqWMa2T2Y'
 const defaultKeyValueSeparator = ':'
+const unknownDeviceErrorCodes = [
+  'sbol.auth.unknown-device.error',
+  'sbol.auth.untrusted-device.error'
+]
 
 export class AuthError {}
 
 export function getAuthToken ({ login, password }) {
   return 'Basic ' + forge.util.encode64(getByteStringFromString(login) + defaultKeyValueSeparator + getByteStringFromString(password))
+}
+
+function getSbolClientAuthToken () {
+  return getAuthToken({
+    login: sbolClientId,
+    password: sbolClientSecret
+  })
 }
 
 export function generateDevice (device) {
@@ -30,18 +50,51 @@ export function generateDevice (device) {
   }
 }
 
-async function callGate (url, options = {}) {
-  const headers = {
-    ...options.headers,
+function getDeviceModel () {
+  return ZenMoney.device?.model || 'Sync'
+}
+
+function getDeviceManufacturer () {
+  return ZenMoney.device?.manufacturer || ZenMoney.device?.brand || 'ZenMoney'
+}
+
+function getDeviceOsVersion () {
+  return ZenMoney.device?.osVersion || ZenMoney.device?.androidVersion || '14'
+}
+
+function getUserAgent () {
+  return `sbol/${appVersion} (android ${getDeviceOsVersion()}) ${getDeviceModel()}`
+}
+
+function getSbolHeaders (device, headers = {}) {
+  return {
+    ...headers,
     Accept: 'application/json; charset=UTF-8',
-    'X-Sbol-OS': 'android',
-    'X-Sbol-Version': '3.8.3',
-    'X-Sbol-Id': options.device.androidId,
-    'User-Agent': 'sbol/3.8.3 (android 8.0.0) ' + ZenMoney.device.model,
+    // The legacy API returns HTTP 500 for fetch's default Accept-Language: *.
+    'Accept-Language': 'ru',
+    'X-Sbol-Os': 'android',
+    'X-Sbol-Version': appVersion,
+    'X-Sbol-Id': device.androidId,
+    'User-Agent': getUserAgent(),
     Host: host,
     Connection: 'Keep-Alive',
     'Accept-Encoding': 'gzip'
   }
+}
+
+function generateHex (bytes) {
+  return forge.util.bytesToHex(forge.random.getBytesSync(bytes))
+}
+
+function getTraceparentHeader () {
+  return `00-${generateHex(16)}-${generateHex(8)}-01`
+}
+
+async function callGate (url, options = {}) {
+  const headers = getSbolHeaders(options.device, {
+    ...options.sessionId && { 'X-Sbol-Session-Id': options.sessionId },
+    ...options.headers
+  })
 
   const response = await fetchJson(url, {
     stringify,
@@ -57,7 +110,7 @@ async function callGate (url, options = {}) {
 }
 
 async function prepareDevice (device) {
-  return callGate(`https://${host}/SBOLServer/rest/registration/prepareDevice`, {
+  return callGate(`${apiBaseUrl}/rest/registration/prepareDevice`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json;charset=UTF-8'
@@ -72,7 +125,7 @@ async function prepareDevice (device) {
 }
 
 async function trustDevice (smsCode, device) {
-  return callGate(`https://${host}/SBOLServer/rest/registration/trustedDevice`, {
+  return callGate(`${apiBaseUrl}/rest/registration/trustedDevice`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json;charset=UTF-8'
@@ -87,76 +140,262 @@ async function trustDevice (smsCode, device) {
   })
 }
 
-async function initiateLoginSequence (auth, device) {
-  const options = {
-    method: 'POST',
+function base64UrlEncode (byteString) {
+  return forge.util.encode64(byteString).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+function generateCodeVerifier () {
+  return base64UrlEncode(forge.random.getBytesSync(64))
+}
+
+function generateCodeChallenge (verifier) {
+  const md = forge.md.sha256.create()
+  md.update(verifier, 'utf8')
+  return base64UrlEncode(md.digest().getBytes())
+}
+
+function parseBody (body) {
+  if (typeof body !== 'string' || body.length === 0) {
+    return body
+  }
+  try {
+    return JSON.parse(body)
+  } catch (e) {
+    return body
+  }
+}
+
+function getHeader (response, name) {
+  return response.headers[name.toLowerCase()] || response.headers[name]
+}
+
+function addResponseCookies (cookies, response) {
+  const setCookie = getHeader(response, 'set-cookie')
+  if (!setCookie) {
+    return
+  }
+  const cookieHeaders = Array.isArray(setCookie) ? setCookie : [setCookie]
+  for (const cookieHeader of cookieHeaders) {
+    for (const cookie of String(cookieHeader).split(/,(?=\s*[^;,]+=)/g)) {
+      const pair = cookie.split(';')[0]
+      const separatorIndex = pair.indexOf('=')
+      if (separatorIndex < 0) {
+        continue
+      }
+      const name = pair.substring(0, separatorIndex).trim()
+      const value = pair.substring(separatorIndex + 1).trim()
+      if (value) {
+        cookies[name] = value
+      } else {
+        delete cookies[name]
+      }
+    }
+  }
+}
+
+function getCookieHeader (cookies) {
+  return Object.keys(cookies).map(key => `${key}=${cookies[key]}`).join('; ')
+}
+
+function resolveAuthUrl (url) {
+  const resolvedUrl = new URL(url, `${authBaseUrl}/`)
+  if (resolvedUrl.hostname === internalAuthHost) {
+    const publicAuthBasePath = new URL(authBaseUrl).pathname
+    resolvedUrl.protocol = 'https:'
+    resolvedUrl.hostname = host
+    if (!resolvedUrl.pathname.startsWith(`${publicAuthBasePath}/`)) {
+      resolvedUrl.pathname = `${publicAuthBasePath}${resolvedUrl.pathname}`
+    }
+  }
+  return resolvedUrl.toString()
+}
+
+function getAuthCodeFromLocation (location) {
+  if (!location || location.indexOf(authRedirectUri) !== 0) {
+    return null
+  }
+  return new URL(location).searchParams.get('code')
+}
+
+function isRedirect (response) {
+  return response.status >= 300 && response.status < 400 && Boolean(getHeader(response, 'location'))
+}
+
+function isInternalAuthRootLocation (location) {
+  if (!location) {
+    return false
+  }
+  const parsedLocation = new URL(location, `${authBaseUrl}/`)
+  return internalAuthRootHosts.includes(parsedLocation.hostname) && parsedLocation.pathname === '/'
+}
+
+function getAuthorizeUrl (codeChallenge, extraParams = {}) {
+  return `${authBaseUrl}/oauth2/authorize?${stringify({
+    response_type: 'code',
+    scope: 'read',
+    client_id: sbolClientId,
+    redirect_uri: authRedirectUri,
+    code_challenge_method: 'S256',
+    code_challenge: codeChallenge,
+    ...extraParams
+  })}`
+}
+
+function getLoginErrorDescription (response) {
+  return response.body?.errorDescription || response.body?.error_description || response.body?.message
+}
+
+function isInvalidLoginOrPassword (response) {
+  const errorCode = response.body?.errorCode || response.body?.error
+  const errorDescription = getLoginErrorDescription(response) || ''
+  return errorCode === 'sbol.auth.correct-login-password.error' ||
+    errorDescription.indexOf('Неверный логин или пароль') >= 0 ||
+    errorDescription.indexOf('Invalid username or password') >= 0
+}
+
+function isUnknownDeviceResponse (response) {
+  const errorCode = response.body?.errorCode
+  const sbolStatus = getHeader(response, 'sbol-status')
+  return response.status === 428 ||
+    unknownDeviceErrorCodes.includes(errorCode) ||
+    ['new_device', 'unknown_device', 'untrusted_device'].includes(sbolStatus)
+}
+
+function handleLoginFailureResponse (response) {
+  if (isInvalidLoginOrPassword(response)) {
+    throw new InvalidLoginOrPasswordError()
+  }
+  const description = getLoginErrorDescription(response)
+  if (description) {
+    throw new BankMessageError(description)
+  }
+  console.assert(false, 'Unknown login error', response)
+}
+
+async function fetchOAuth (url, { skipSbolHeaders = false, ...options } = {}) {
+  const oauthHeaders = {
+    ...options.headers,
+    traceparent: getTraceparentHeader()
+  }
+  const headers = skipSbolHeaders
+    ? oauthHeaders
+    : getSbolHeaders(options.device, oauthHeaders)
+  const response = await fetchText(url, {
+    stringify,
+    redirect: 'manual',
+    ...options,
+    headers,
+    sanitizeRequestLog: defaultsDeep({ headers: { Authorization: true, Cookie: true, 'X-Sbol-Id': true }, url: { query: { code_challenge: true } } }, options && options.sanitizeRequestLog),
+    sanitizeResponseLog: defaultsDeep({ headers: { 'set-cookie': true, location: true }, body: true }, options && options.sanitizeResponseLog)
+  })
+  response.body = parseBody(response.body)
+  return response
+}
+
+async function requestOAuthToken (auth, device) {
+  const sessionId = generateUUID()
+  const codeVerifier = generateCodeVerifier()
+  const codeChallenge = generateCodeChallenge(codeVerifier)
+  const cookies = {}
+
+  const authorizeResponse = await fetchOAuth(getAuthorizeUrl(codeChallenge), {
+    method: 'GET',
+    device,
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-      Authorization: getAuthToken(auth)
+      'X-Sbol-Model': getDeviceModel(),
+      'X-Sbol-Name': getDeviceManufacturer(),
+      'X-Sbol-DevOS': `android ${getDeviceOsVersion()}`
+    }
+  })
+  addResponseCookies(cookies, authorizeResponse)
+  if (authorizeResponse.status !== 200) {
+    return {
+      response: authorizeResponse,
+      sessionId
+    }
+  }
+
+  const loginResponse = await fetchOAuth(`${authBaseUrl}/oauth2/login`, {
+    method: 'POST',
+    device,
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+      provider: 'BASIC',
+      // The mobile app sends this header through BizoneInterceptor even when the report is unavailable.
+      'X-Sbol-Sdk': '',
+      'X-Sbol-Session-Id': sessionId,
+      'X-Geo-Consent': 'true',
+      Cookie: getCookieHeader(cookies)
     },
     body: {
-      client_id: auth.login,
-      client_secret: auth.password,
-      grant_type: 'client_credentials'
+      username: auth.login,
+      password: auth.password
     },
-    sanitizeRequestLog: { headers: { Authorization: true }, body: { client_id: true, client_secret: true } },
-    device
+    sanitizeRequestLog: { headers: { Cookie: true, 'X-Sbol-Id': true }, body: { username: true, password: true } }
+  })
+  addResponseCookies(cookies, loginResponse)
+  if (!isRedirect(loginResponse)) {
+    return {
+      response: loginResponse,
+      sessionId
+    }
   }
+
+  const loginLocation = getHeader(loginResponse, 'location')
+  // The app gets an internal root Location here; public ingress needs the original authorize endpoint with continue=true.
+  const continueUrl = isInternalAuthRootLocation(loginLocation)
+    ? getAuthorizeUrl(codeChallenge, { continue: true })
+    : resolveAuthUrl(loginLocation)
+  const continueResponse = await fetchOAuth(continueUrl, {
+    method: 'GET',
+    skipSbolHeaders: true,
+    device,
+    headers: {
+      Cookie: getCookieHeader(cookies)
+    }
+  })
+  addResponseCookies(cookies, continueResponse)
+  const authCode = getAuthCodeFromLocation(getHeader(continueResponse, 'location'))
+  if (!isRedirect(continueResponse) || !authCode) {
+    return {
+      response: continueResponse,
+      sessionId
+    }
+  }
+
+  const tokenResponse = await fetchOAuth(`${authBaseUrl}/oauth2/token`, {
+    method: 'POST',
+    device,
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+      Authorization: getSbolClientAuthToken(),
+      'X-Sbol-Session-Id': sessionId
+    },
+    body: {
+      grant_type: 'authorization_code',
+      code: authCode,
+      redirect_uri: authRedirectUri,
+      client_id: sbolClientId,
+      code_verifier: codeVerifier
+    },
+    sanitizeRequestLog: { headers: { Authorization: true, 'X-Sbol-Id': true }, body: { code: true, code_verifier: true } }
+  })
+  return {
+    response: tokenResponse,
+    sessionId
+  }
+}
+
+async function initiateLoginSequence (auth, device) {
   const newDevice = generateDevice(device)
-  let response = await callGate(`https://${host}/SBOLServer/oauth/token`, options)
-  if (response.status === 401 && response.body.error === 'unauthorized') {
-    if (response.body.error_description) {
-      if ([
-        'Invalid username or password',
-        'Неверное имя пользователя или пароль'
-      ].some(str => response.body.error_description.indexOf(str) >= 0)) {
-        throw new InvalidLoginOrPasswordError()
-      }
-      if ([
-        'Неверный имя пользователя или пароль',
-        'Аккаунт временно заблокирован',
-        'Попробуйте после'
-      ].some(str => response.body.error_description.indexOf(str) >= 0)) {
-        throw new InvalidPreferencesError(response.body.error_description)
-      }
-      if ([
-        'Ожидается обработка Вашей заявки'
-      ].some(str => response.body.error_description.indexOf(str) >= 0)) {
-        throw new BankMessageError(response.body.error_description)
-      }
-      if ([
-        /^.*blocked.*$/,
-        /^.*Ваша учетная запись временно заблокирована.*$/,
-        /^.*Необходимо подтвердить регистрацию.*$/
-      ].some(regexp => response.body.error_description.match(regexp))) {
-        throw new BankMessageError(response.body.error_description)
-      }
-      if (![
-        'device',
-        'неизвестного устройства'
-      ].some(str => response.body.error_description.indexOf(str) >= 0)) {
-        console.assert(false, 'Unknown login error')
-      }
+  let loginResult = await requestOAuthToken(auth, newDevice)
+  if (isUnknownDeviceResponse(loginResult.response)) {
+    const sbolUdid = getHeader(loginResult.response, 'sbol-udid')
+    if (sbolUdid) {
+      newDevice.udid = sbolUdid
     }
-    const optionsBearer = {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-        Authorization: 'Bearer null'
-      },
-      body: {
-        client_id: auth.login,
-        client_secret: auth.password,
-        grant_type: 'client_credentials'
-      },
-      sanitizeRequestLog: { headers: { Authorization: true }, body: { client_id: true, client_secret: true } },
-      device
-    }
-    response = await callGate(`https://${host}/SBOLServer/oauth/token`, optionsBearer)
-    if (response.headers['sbol-udid'] && response.headers['sbol-status'] && response.headers['sbol-status'] === 'new_device') {
-      newDevice.udid = response.headers['sbol-udid']
-    }
-    response = await prepareDevice(newDevice)
+    let response = await prepareDevice(newDevice)
     console.assert(response.body.errorInfo.errorCode === '0', 'Error while registering device.', response)
 
     const code = await ZenMoney.readLine('Введите код из SMS')
@@ -167,44 +406,57 @@ async function initiateLoginSequence (auth, device) {
       console.assert(response.body.errorInfo.errorCode === '0', 'Error while registering device.', response)
     }
 
-    response = await callGate(`https://${host}/SBOLServer/oauth/token`, options)
+    loginResult = await requestOAuthToken(auth, newDevice)
+  }
+  const response = loginResult.response
+  if (!response.body?.access_token) {
+    handleLoginFailureResponse(response)
   }
   return {
     response,
-    device: newDevice
+    device: newDevice,
+    sessionId: loginResult.sessionId
   }
 }
 
 export async function updateToken (auth) {
-  const response = await callGate(`https://${host}/SBOLServer/oauth/token`, {
+  if (!auth.refreshToken || !auth.sessionId) {
+    return login(auth, auth.device)
+  }
+  const response = await fetchOAuth(`${authBaseUrl}/oauth2/token`, {
     method: 'POST',
+    device: auth.device,
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-      Authorization: getAuthToken(auth)
+      Authorization: getSbolClientAuthToken(),
+      'X-Sbol-Session-Id': auth.sessionId
     },
     body: {
-      client_id: auth.login,
-      client_secret: auth.password,
-      grant_type: 'client_credentials'
+      grant_type: 'refresh_token',
+      refresh_token: auth.refreshToken,
+      client_id: sbolClientId
     },
-    sanitizeRequestLog: { headers: { Authorization: true }, body: { client_id: true, client_secret: true } },
-    device: auth.device
+    sanitizeRequestLog: { headers: { Authorization: true, 'X-Sbol-Id': true }, body: { refresh_token: true } }
   })
-  console.assert(response.body.access_token, 'Error, while getting token.', response)
+  if (!response.body?.access_token) {
+    return login(auth, auth.device)
+  }
   return {
     ...auth,
-    token: response.body.access_token
+    token: response.body.access_token,
+    refreshToken: response.body.refresh_token || auth.refreshToken
   }
 }
 
 async function fetchListMoneyBox (auth) {
-  const response = await callGate(`https://${host}/SBOLServer/rest/client/getListMoneybox`, {
+  const response = await callGate(`${apiBaseUrl}/rest/client/getListMoneybox`, {
     method: 'GET',
     headers: {
       Authorization: 'Bearer ' + auth.token
     },
     sanitizeRequestLog: { headers: { Authorization: true } },
-    device: auth.device
+    device: auth.device,
+    sessionId: auth.sessionId
   })
   if (response.body.error === 'invalid_token') {
     throw new AuthError()
@@ -214,48 +466,6 @@ async function fetchListMoneyBox (auth) {
 }
 
 export async function login ({ login, password }, device) {
-  if (ZenMoney.trustCertificates) {
-    ZenMoney.trustCertificates([
-      `-----BEGIN CERTIFICATE-----
-MIIGlTCCBX2gAwIBAgIQDixfIHPvT9Zw1dqtnRc7eTANBgkqhkiG9w0BAQsFADBZ
-MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMTMwMQYDVQQDEypS
-YXBpZFNTTCBUTFMgRFYgUlNBIE1peGVkIFNIQTI1NiAyMDIwIENBLTEwHhcNMjIw
-MjA4MDAwMDAwWhcNMjMwMjA4MjM1OTU5WjAcMRowGAYDVQQDDBEqLmJwcy1zYmVy
-YmFuay5ieTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMLlzMioTb9A
-/0CuLm/u5YhAHjUOSQURNkB4ghcGiYA2BuF3vt0SqDm5REdlOHMNr+PhpojJXSnm
-r0phWcBRG2/hlA83Wl+uMra02JGsdse2S+EtmP1AdbUt3ciMNl+qRUbYqWfR3aRC
-haRwaQO5ZXLtUSWMermT+05EO7IJe7J5ZbCMLw7nqLm4d9jNTeUGB/zMqO36jB9u
-OVgPnrovDa1P2GaGEdm8ciMSh8I2zRSq0JKuG3wd8ZGfZ7Kbrid+WWw6dSB1UZrH
-VGDwPxcJBog3vAbIDcmzAa7pSR4nS+Omv1DjS8klz7O6C2fYRGMAgFEk/hgXWwgQ
-RYFlckrY1JkCAwEAAaOCA5QwggOQMB8GA1UdIwQYMBaAFKSN5b58eeRwI20uKTSt
-I1jc9TF/MB0GA1UdDgQWBBS0i/ZeW6DLnbrZEBANK67/8yDIxDAtBgNVHREEJjAk
-ghEqLmJwcy1zYmVyYmFuay5ieYIPYnBzLXNiZXJiYW5rLmJ5MA4GA1UdDwEB/wQE
-AwIFoDAdBgNVHSUEFjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwgZsGA1UdHwSBkzCB
-kDBGoESgQoZAaHR0cDovL2NybDMuZGlnaWNlcnQuY29tL1JhcGlkU1NMVExTRFZS
-U0FNaXhlZFNIQTI1NjIwMjBDQS0xLmNybDBGoESgQoZAaHR0cDovL2NybDQuZGln
-aWNlcnQuY29tL1JhcGlkU1NMVExTRFZSU0FNaXhlZFNIQTI1NjIwMjBDQS0xLmNy
-bDA+BgNVHSAENzA1MDMGBmeBDAECATApMCcGCCsGAQUFBwIBFhtodHRwOi8vd3d3
-LmRpZ2ljZXJ0LmNvbS9DUFMwgYUGCCsGAQUFBwEBBHkwdzAkBggrBgEFBQcwAYYY
-aHR0cDovL29jc3AuZGlnaWNlcnQuY29tME8GCCsGAQUFBzAChkNodHRwOi8vY2Fj
-ZXJ0cy5kaWdpY2VydC5jb20vUmFwaWRTU0xUTFNEVlJTQU1peGVkU0hBMjU2MjAy
-MENBLTEuY3J0MAkGA1UdEwQCMAAwggF9BgorBgEEAdZ5AgQCBIIBbQSCAWkBZwB2
-AOg+0No+9QY1MudXKLyJa8kD08vREWvs62nhd31tBr1uAAABftlCiEMAAAQDAEcw
-RQIgU5PNDKs44Z5uU7Oa4cp7tqNl5oG/pMCTR7NweZHa6ZwCIQD1kTdOxyGx58vy
-Y/1liZClwAIyQWIipEg+WlE2I3DYZgB1ADXPGRu/sWxXvw+tTG1Cy7u2JyAmUeo/
-4SrvqAPDO9ZMAAABftlCiE8AAAQDAEYwRAIgUzly3zRmNXnN9wm4u2HN9MN6qc8l
-r3UECuV/QaolspMCIAcJcwvH5zvfOr0VTl1cWeRKdyvd7e7sc25UWhwvyvhbAHYA
-s3N3B+GEUPhjhtYFqdwRCUp5LbFnDAuH3PADDnk2pZoAAAF+2UKIgwAABAMARzBF
-AiBYoLNolLyeygDHkrcFjrze5HeYtEJFZ3epoWdNSINpagIhAKuTRqRSAde7EfpB
-0MGEkrG5nn6cSnnTrnYSzr3XBdYcMA0GCSqGSIb3DQEBCwUAA4IBAQB4lqFA1bYo
-kEBC0mGycV+UYJsrT03YIHRALRyOeZwGKkEDypIeOJkgtQrz3cKKPbEtBQ5T9Xc2
-xpcbc0CpMCsJklyHHKHQJKUycdY1jJomLeXhrb2OEbDdesZXFaSJFiVgZytzd9ia
-54DFLrNmXs0KHu8NbFnTtACGdfzjNdjPqe4GPagzu84xw0Oo3iOvrXXLMXJizKlK
-hCNUpK9IN3mhx11jlYnUq2SXm+JBlcM8qwJK0DVkJkfVnoiwRjviJjXlJYjw3beD
-GDuEVMZ6YPtmbdejtasHZ7MDeZinHlx/7G0DWQ7CDzw/Lo5dhjH1cFL0ApnxzQMs
-+d8KdEFjsywZ
------END CERTIFICATE-----`
-    ])
-  }
   if (password === login) {
     throw new InvalidPreferencesError('Логин и пароль не могут быть одинаковыми')
   }
@@ -271,18 +481,21 @@ GDuEVMZ6YPtmbdejtasHZ7MDeZinHlx/7G0DWQ7CDzw/Lo5dhjH1cFL0ApnxzQMs
     login,
     password,
     token: accessToken,
+    refreshToken: loginResult.response.body.refresh_token,
+    sessionId: loginResult.sessionId,
     device: loginResult.device
   }
 }
 
 export async function fetchAccounts (auth) {
-  const response = await callGate(`https://${host}/SBOLServer/rest/client/contracts`, {
+  const response = await callGate(`${apiBaseUrl}/rest/client/contracts`, {
     method: 'GET',
     headers: {
       Authorization: 'Bearer ' + auth.token
     },
     sanitizeRequestLog: { headers: { Authorization: true } },
-    device: auth.device
+    device: auth.device,
+    sessionId: auth.sessionId
   })
   if (response.body.error === 'invalid_token') {
     throw new AuthError()
@@ -303,7 +516,7 @@ export async function updateBalances (auth, accounts) {
   await Promise.all(accounts.map(async (account) => {
     if (account.cardList && account.cardList.length > 0) {
       const card = account.cardList[0]
-      const response = await callGate(`https://${host}/SBOLServer/rest/client/balance`, {
+      const response = await callGate(`${apiBaseUrl}/rest/client/balance`, {
         method: 'POST',
         headers: {
           Authorization: 'Bearer ' + auth.token,
@@ -316,6 +529,7 @@ export async function updateBalances (auth, accounts) {
         },
         sanitizeRequestLog: { headers: { Authorization: true } }, // , body: { cardExpire: true, cardId: true, currency: true } },
         device: auth.device,
+        sessionId: auth.sessionId,
         stringify: JSON.stringify
       })
       console.assert(response.body.errorInfo && response.body.errorInfo.errorCode === '0', 'Error while getting actual balance for account', account)
@@ -340,25 +554,10 @@ export async function fetchTransactions (auth, products, fromDate, toDate, contr
     },
     sanitizeRequestLog: { headers: { Authorization: true } },
     device: auth.device,
+    sessionId: auth.sessionId,
     stringify: JSON.stringify
   }
-  let response
-  await Promise.all(products.map(async (product) => {
-    response = await callGate(`https://${host}/SBOLServer/rest/client/holdEvents`, {
-      ...options,
-      body: {
-        cardId: product.id
-      }
-    })
-    if (response.body.error === 'invalid_token') {
-      throw new AuthError()
-    }
-    if (response.body.event) {
-      transactions.push(...response.body.event)
-    }
-  }))
-
-  response = await callGate(`https://${host}/SBOLServer/rest/client/events`, {
+  const response = await callGate(`${apiBaseUrl}/rest/client/events`, {
     ...options,
     body: {
       contractNumber,

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<provider>
+    <id>bybit</id>
+    <company>16190</company>
+    <description>
+        Bybit Unified, Funding, Flexible Earn and Card synchronization via the public Bybit V5 REST API.
+        Requires a read-only API Key + Secret minted in Bybit Dashboard → API
+        with &quot;Bybit Card&quot;, &quot;Wallet&quot;, and &quot;Exchange History&quot; permissions enabled.
+        Imports the native wallet balances. Card purchases are attached to the
+        configured payment wallet, not imported as a duplicate Card balance.
+    </description>
+
+
+</provider>

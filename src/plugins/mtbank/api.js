@@ -1,7 +1,7 @@
 import { defaultsDeep, flatMap } from 'lodash'
 import { createDateIntervals as commonCreateDateIntervals } from '../../common/dateUtils'
 import { fetchJson } from '../../common/network'
-import { BankMessageError, InvalidOtpCodeError } from '../../errors'
+import { BankMessageError, InvalidOtpCodeError, InvalidPreferencesError, TemporaryError } from '../../errors'
 import { getDate } from './converters'
 
 const baseUrl = 'https://mybank.by/api/v1/'
@@ -9,6 +9,19 @@ const baseUrl = 'https://mybank.by/api/v1/'
 async function fetchApiJson (url, options, predicate = () => true, error = (message) => console.assert(false, message)) {
   options = defaultsDeep(
     options,
+    {
+      headers: {
+        Origin: 'https://mybank.by',
+        Referer: 'https://mybank.by/',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
+        'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': 'macOS'
+      }
+    },
     {
       sanitizeRequestLog: { headers: { Cookie: true } },
       sanitizeResponseLog: { headers: { 'set-cookie': true } }
@@ -64,39 +77,81 @@ async function fetchApiJson (url, options, predicate = () => true, error = (mess
   return response
 }
 
-function validateResponse (response, predicate, error = (message) => console.assert(false, message)) {
+function validateResponse (response, predicate, error = (message) => new TemporaryError(message)) {
   if (!predicate || !predicate(response)) {
-    error('non-successful response')
+    const maybeError = error('non-successful response')
+    throw maybeError !== undefined ? maybeError : new TemporaryError('non-successful response')
   }
 }
 
-function cookies (response) {
-  if (response.headers) {
-    const cookies = response.headers['set-cookie']
-    if (cookies) {
-      const requiredValues = /(JSESSIONID=[^;]*;).*(TS[^=]*=[^;]*;)/
-      return requiredValues.exec(cookies).slice(1).join(';')
-    } else {
-      return cookies
+function parseCookies (response) {
+  const map = new Map()
+
+  if (!response.headers) return map // for tests
+
+  const cookieString = response.headers['set-cookie']
+
+  if (!cookieString) return map
+
+  const cookies = cookieString.split(/,\s*(?=[^;]+?=)/)
+
+  for (const cookie of cookies) {
+    const [pair] = cookie.split(';')
+    const [key, value] = pair.split('=')
+    if (key && value) {
+      map.set(key.trim(), value.trim())
     }
-  } else {
-    return '' // tests not mocking headers, ignoring
   }
+
+  return map
+}
+
+const mapToCookieHeader = (map) => [...map.entries()].map(([key, value]) => `${key}=${value}`).join('; ')
+
+function updateCookies (sessionCookies, response) {
+  if (!response || !response.headers) return
+
+  for (const [key, value] of parseCookies(response).entries()) {
+    sessionCookies.set(key, value)
+  }
+}
+
+async function fetchApiJsonWithSessionCookies (sessionCookies, url, options, predicate, error) {
+  const response = await fetchApiJson(url, {
+    ...options,
+    headers: {
+      ...options?.headers,
+      Cookie: mapToCookieHeader(sessionCookies)
+    }
+  }, predicate, error)
+  updateCookies(sessionCookies, response)
+  return response
+}
+
+export function selectDboContract (contracts = []) {
+  const registeredContracts = contracts.filter(contract => contract.status === 'REGISTERED')
+
+  return registeredContracts.find(contract => contract.role === 'F') ||
+    contracts.find(contract => contract.role === 'F') ||
+    registeredContracts[0] ||
+    contracts[0]
 }
 
 export async function login (login, password) {
+  const cookies = new Map()
+
   let res = await fetchApiJson('login/userIdentityByPhone', {
     method: 'POST',
     body: { phoneNumber: login, loginWay: '1' },
     sanitizeRequestLog: { body: { phoneNumber: true } }
   }, response => response.body.success)
-  const sessionCookies = cookies(res)
+  updateCookies(cookies, res)
 
-  res = await fetchApiJson(
+  res = await fetchApiJsonWithSessionCookies(
+    cookies,
     'login/checkPassword4',
     {
       method: 'POST',
-      headers: { Cookie: sessionCookies },
       body: { password, version: '2.1.18' },
       sanitizeRequestLog: { body: { password: true } },
       sanitizeResponseLog: {
@@ -121,11 +176,11 @@ export async function login (login, password) {
     if (!smsCode) {
       throw new InvalidOtpCodeError()
     }
-    await fetchApiJson(
+    await fetchApiJsonWithSessionCookies(
+      cookies,
       'login/checkSms',
       {
         method: 'POST',
-        headers: { Cookie: sessionCookies },
         body: { smsCode },
         sanitizeRequestLog: { body: { smsCode: true } }
       },
@@ -133,25 +188,28 @@ export async function login (login, password) {
     )
   }
 
-  await fetchApiJson(
+  await fetchApiJsonWithSessionCookies(
+    cookies,
     'user/userRole',
     {
       method: 'POST',
-      body: res.body.data.userInfo.dboContracts[0],
+      body: selectDboContract(res.body.data.userInfo.dboContracts),
       sanitizeRequestLog: { body: true }
     },
-    (response) => response.body.success
+    (response) => response.body.success,
+    (message) => new TemporaryError(message)
   )
 
-  return sessionCookies
+  return cookies
 }
 
 export async function fetchAccounts (sessionCookies) {
   console.log('>>> Загрузка списка счетов...')
-  return (await fetchApiJson('user/loadUser', {
-    headers: { Cookie: sessionCookies }
-  }, response => response.body && response.body.data && response.body.data.products,
-  message => new TemporaryError(message))).body.data.products
+
+  const response = await fetchApiJsonWithSessionCookies(sessionCookies, 'user/loadUser', {}, response => response.body && response.body.data && response.body.data.products,
+    message => new TemporaryError(message))
+
+  return response.body.data.products
 }
 
 function formatDate (date) {
@@ -159,7 +217,7 @@ function formatDate (date) {
 }
 
 export function createDateIntervals (fromDate, toDate) {
-  const interval = 10 * 24 * 60 * 60 * 1000 // 10 days interval for fetching data
+  const interval = 20 * 24 * 60 * 60 * 1000 // 20-day interval for fetching data
   const gapMs = 1
   return commonCreateDateIntervals({
     fromDate,
@@ -171,44 +229,40 @@ export function createDateIntervals (fromDate, toDate) {
 
 export async function fetchTransactions (sessionCookies, accounts, fromDate, toDate = new Date()) {
   console.log('>>> Загрузка списка транзакций...')
-  toDate = toDate || new Date()
 
-  const dates = createDateIntervals(fromDate, toDate)
-  const responses = await Promise.all(flatMap(accounts, (account) => {
-    return dates.map(dates => {
-      return fetchApiJson('product/loadOperationStatements', {
+  const intervals = createDateIntervals(fromDate, toDate || new Date())
+  const operations = []
+
+  for (const account of accounts) {
+    const responses = []
+    for (const [startDate, endDate] of intervals) {
+      responses.push(await fetchApiJsonWithSessionCookies(sessionCookies, 'product/loadOperationStatements', {
         method: 'POST',
-        headers: { Cookie: sessionCookies },
         body: {
           contractCode: account.id,
           accountIdenType: account.productType,
-          startDate: formatDate(dates[0]),
-          endDate: formatDate(dates[1]),
+          startDate: formatDate(startDate),
+          endDate: formatDate(endDate),
           halva: false
         }
-      }, response => response.body)
-    })
-  }))
-
-  const operations = flatMap(responses, response => {
-    if (response) {
-      return flatMap(response.body.data, d => {
-        return d.operations.map(op => {
-          op.accountId = d.accountId
-          if (op.description === null) {
-            op.description = ''
-          }
-          return op
-        })
-      })
+      }, response => response.body))
     }
-  })
+
+    for (const response of responses) {
+      if (!response) continue
+
+      operations.push(...flatMap(response.body.data, d => d.operations.map(op => ({
+        ...op,
+        accountId: d.accountId,
+        description: op.description || ''
+      }))))
+    }
+  }
 
   const filteredOperations = operations.filter(function (op) {
     const date = op.transDate ? getDate(op.transDate) : getDate(`${op.operationDate} 00:00:00`)
     return op !== undefined && op.status !== 'E' && date > fromDate && !op.description.includes('Гашение кредита в виде "овердрафт" по договору')
   })
-  console.log(filteredOperations)
 
   console.log(`>>> Загружено ${filteredOperations.length} операций.`)
   return filteredOperations

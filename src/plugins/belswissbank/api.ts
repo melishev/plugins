@@ -1,10 +1,29 @@
 import { fetch, FetchOptions, FetchResponse } from '../../common/network'
-import { InvalidOtpCodeError, UserInteractionError } from '../../errors'
+import { BankMessageError, InvalidOtpCodeError, UserInteractionError } from '../../errors'
 import { APP_VERSION } from './consts'
 import { Device, Preferences, Session } from './models'
 import { Strings } from './strings'
 import { encryptCredentials, formatToApiDate, getDevice } from './utils'
 import _ from 'lodash'
+import { sanitize } from '../../common/sanitize'
+import { getOptString } from '../../types/get'
+
+function maskCardholder (value: unknown): unknown {
+  if (typeof value !== 'string') return sanitize(value, true)
+  const last4 = /^(\d{4}), /.exec(value)
+  return last4 !== null ? `${last4[1]}, <redacted>` : sanitize(value, true)
+}
+
+function sanitizePaymentLog (payment: unknown): unknown {
+  const payer = _.get(payment, 'last4namePayer') as string | null
+  const target = _.get(payment, 'target') as string | null
+  const payerName = typeof payer === 'string' ? /^\d{4}, (.+)$/.exec(payer)?.[1] : undefined
+  const targetName = typeof target === 'string' ? /^\d{4}, (.+)$/.exec(target)?.[1] : undefined
+  return sanitize(payment, {
+    last4namePayer: maskCardholder,
+    ...(payerName !== undefined && payerName === targetName ? { target: maskCardholder } : {})
+  })
+}
 
 const BASE_URL = 'https://mobile.bsb.by/api/v1/'
 
@@ -18,6 +37,18 @@ interface LoginResponse {
     accessToken: string
     widgetToken: string
   }
+}
+
+function raiseUnhandledResponse (response: FetchResponse): never {
+  const header = _.get(response.body, 'header', '') as string
+  const message = _.get(response.body, 'message') as string
+  const code = _.get(response.body, 'code') as string
+  const rest = _.omit(response.body as {}, 'header', 'message', 'code')
+  throw new Error([
+    `${response.status} ${code}: ${header}`,
+    message,
+    Object.keys(rest).length > 0 ? JSON.stringify(rest) : ''
+  ].filter(Boolean).join('\n'))
 }
 
 export class Api {
@@ -38,7 +69,8 @@ export class Api {
 
   async fetchCards (): Promise<unknown[]> {
     const response = await this.fetchApi('card-management/cards/actual?with-tokenized=false&with-hidden=false', {
-      method: 'GET'
+      method: 'GET',
+      sanitizeResponseLog: { body: { nameOnCard: true } }
     })
     return response.body as unknown[]
   }
@@ -68,7 +100,10 @@ export class Api {
           pageSize,
           showConsumptions: false,
           showEnrollments: false,
-          showTransfers: true
+          showTransfers: false
+        },
+        sanitizeResponseLog: {
+          body: { payments: (payments: unknown) => Array.isArray(payments) ? payments.map(sanitizePaymentLog) : payments }
         }
       })
 
@@ -121,7 +156,8 @@ export class Api {
           userDeviceId: true
         }
       },
-      parse: () => null
+      parse: () => null,
+      isUnhandled: () => false
     })
     if (response.status !== 200) {
       throw new Error(`Unexpected confirm SMS code response status: ${response.status}`)
@@ -182,11 +218,17 @@ export class Api {
             widgetToken: true
           }
         }
-      }
+      },
+      isUnhandled: () => false
     })
     if (response.status === 400) {
+      const message = getOptString(response.body, 'message')
+      if (getOptString(response.body, 'code') === 'MAS-0073' &&
+        message === 'Для восстановления доступа сбросьте пароль или повторите попытку позже') {
+        throw new BankMessageError(message)
+      }
       if (_.get(response.body, 'code') !== 'MAS-0007') {
-        throw new Error('Unexpected login response. Bank Message: ' + String(_.get(response.body, 'message', 'no message')))
+        raiseUnhandledResponse(response)
       }
 
       return {
@@ -204,8 +246,9 @@ export class Api {
           widgetToken: _.get(response.body, 'widgetTokenContainer.widgetToken')
         }
       }
+    } else {
+      raiseUnhandledResponse(response)
     }
-    throw new Error(`Unexpected login response status: ${response.status}`)
   }
 
   private async fetchSalt (): Promise<string> {
@@ -220,7 +263,11 @@ export class Api {
     return response.body as string
   }
 
-  private async fetchApi (url: string, options: FetchOptions): Promise<FetchResponse> {
+  private async fetchApi (url: string, {
+    isUnhandled = (response) => response.status !== 200, ...options
+  }: FetchOptions & {
+    isUnhandled?: (res: FetchResponse) => boolean
+  }): Promise<FetchResponse> {
     const response = await fetch(BASE_URL + url, {
       method: options.method,
       headers: {
@@ -228,25 +275,22 @@ export class Api {
         ...(options?.headers as object ?? {})
       },
       body: options.body,
-      sanitizeRequestLog: _.defaultsDeep({}, options.sanitizeRequestLog ?? {
+      sanitizeRequestLog: _.defaultsDeep({
         headers: {
           Authorization: true
         }
-      }),
-      sanitizeResponseLog: _.defaultsDeep({}, options.sanitizeResponseLog ?? {
+      }, options.sanitizeRequestLog),
+      sanitizeResponseLog: _.defaultsDeep({
         headers: {
           'set-cookie': true
         }
-      }),
+      }, options.sanitizeResponseLog),
       parse: options.parse ?? JSON.parse,
       stringify: options.stringify ?? JSON.stringify
     })
 
-    if (response.status === 401) {
-      const header = _.get(response.body, 'header', '') as string
-      const message = _.get(response.body, 'message', '') as string
-      const code = _.get(response.body, 'code') as string
-      throw new Error(`${code}: ${header}. ${message}`.trim())
+    if (isUnhandled(response)) {
+      raiseUnhandledResponse(response)
     }
 
     return response

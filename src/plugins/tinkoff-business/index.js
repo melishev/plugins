@@ -1,8 +1,10 @@
 import _ from 'lodash'
 import { AuthError, fetchAccounts, fetchTransactions, login } from './api'
 import { convertAccount, convertToZenMoneyTransactions, convertTransaction } from './converters'
+import { getTrustedCertificates } from './certificates'
 
 export async function scrape ({ preferences, fromDate, toDate, isInBackground }) {
+  ZenMoney.trustCertificates(getTrustedCertificates())
   if (!toDate) {
     toDate = new Date()
   }

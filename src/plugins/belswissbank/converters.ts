@@ -1,4 +1,4 @@
-import { AccountOrCard, AccountType, Transaction } from '../../types/zenmoney'
+import { AccountOrCard, AccountType, Movement, Transaction } from '../../types/zenmoney'
 import codeToCurrencyLookup from '../../common/codeToCurrencyLookup'
 import _ from 'lodash'
 
@@ -204,6 +204,7 @@ export function convertAccounts (apiAccounts: unknown[]): ConvertResult[] {
       }
     })
 }
+
 /*
   {
             "id": 113710793,
@@ -228,41 +229,116 @@ export function convertAccounts (apiAccounts: unknown[]): ConvertResult[] {
             "favoriteId": null
         },
   */
-export function convertTransactions (apiTransactions: unknown[]): Transaction[] {
-  return apiTransactions
-    .map(transaction => {
-      try {
-        return {
-          hold: false,
-          date: parseDate(_.get(transaction, 'paymentDate')),
-          movements: [
-            {
-              id: String(_.get(transaction, 'id')),
-              account: { id: String(_.get(transaction, 'cardId')) },
-              sum: _.get(transaction, 'summa'),
-              fee: 0,
-              invoice: null
-            }
-          ],
-          merchant: {
-            fullTitle: _.get(transaction, 'target'),
+export function * convertTransactions (apiTransactions: unknown[], apiCards: unknown[] = []): Generator<Transaction> {
+  const cards = convertCards(apiCards)
+  const cardsByRetailId = _.groupBy(apiCards, card => _.get(card, 'cardRetailId'))
+  for (const transaction of apiTransactions) {
+    try {
+      const summa = _.get(transaction, 'summa') as number
+      const otkaz = _.get(transaction, 'transactionType') as string
+      if (summa === 0) {
+        // e.g. preauthorization
+        continue
+      }
+      if (otkaz?.includes('OTKAZ')) {
+        continue
+      }
+      const isEnrollment = _.get(transaction, 'isEnrollment') as boolean
+      const currCode = _.get(transaction, 'currCode') as string
+      const currencyTypePayer = _.get(transaction, 'currencyTypePayer') as string
+      const balanceBefore = _.get(transaction, 'balanceBefore') as number | null
+      const balanceAfter = _.get(transaction, 'balanceAfter') as number | null
+
+      let sum: Movement['sum']
+      let invoice: Movement['invoice']
+
+      if (currCode === currencyTypePayer) {
+        // No currency conversion - use summa directly
+        // isEnrollment: false = outcome (expense), sum should be negative
+        // isEnrollment: true = income, sum should be positive
+        sum = isEnrollment ? summa : -summa
+        invoice = null
+      } else {
+        // Currency conversion - calculate from balance difference
+        if (balanceBefore != null && balanceAfter != null) {
+          sum = Math.round((balanceAfter - balanceBefore) * 100) / 100
+        } else {
+          sum = null
+        }
+        invoice = {
+          sum: isEnrollment ? summa : -summa,
+          instrument: currCode
+        }
+      }
+
+      const date = parseDate(_.get(transaction, 'paymentDate'))
+      const cardId = String(_.get(transaction, 'cardId'))
+      const card = cards.find(({ account }) => account.id === cardId)
+      const transactionMerchant = _.get(transaction, 'target') as string | null
+      const paymentType = _.get(transaction, 'paymentType') as string
+      const recipients = cardsByRetailId[_.get(transaction, 'cardRetailIdRecipient')] ?? []
+      const recipient = recipients.length === 1
+        ? cards.find(({ account }) => account.id === String(_.get(recipients[0], 'id')))
+        : undefined
+      const isInternalOutcome = card !== undefined && !isEnrollment && paymentType === 'TRANSFER' &&
+        recipient !== undefined && recipient.account.id !== cardId && recipient.account.instrument === currCode
+      const isInternalIncome = card !== undefined && isEnrollment && paymentType === 'TRANSACTION' &&
+        _.get(transaction, 'transactionType') === 'POPOLNENIE' && transactionMerchant === 'OBMEN VALUT BSB'
+      const transferAccountId = isInternalOutcome ? recipient?.account.id : isInternalIncome ? cardId : undefined
+      const groupKeys = transferAccountId !== undefined
+        ? [`bsb-transfer:${transferAccountId}:${date.toISOString()}:${currCode}:${summa}`]
+        : undefined
+
+      let comment = _.get(transaction, 'commentText') as string | null
+      const isNumericEripTarget = paymentType === 'ERIP' && typeof transactionMerchant === 'string' && /^\d+$/.test(transactionMerchant)
+      if (isNumericEripTarget) {
+        const paymentName = _.get(transaction, 'paymentName') as string | null
+        if (paymentName != null && paymentName.trim() !== '') {
+          const suffix = ` ${transactionMerchant}`
+          const label = paymentName.endsWith(suffix) ? paymentName.slice(0, -suffix.length).trim() : paymentName.trim()
+          const comments = _.uniq([label, comment].filter(value => value != null && value !== ''))
+          comment = comments.length > 0 ? comments.join('\n') : null
+        }
+      }
+      const isValidMerchant = transferAccountId === undefined && !isNumericEripTarget &&
+        typeof transactionMerchant === 'string' && transactionMerchant.trim() !== ''
+      const merchant = isValidMerchant
+        ? {
+            fullTitle: transactionMerchant,
             mcc: null,
             location: null
-          },
-          comment: _.get(transaction, 'commentText')
-        }
-      } catch (e) {
-        console.error(e, transaction)
-        throw new Error('Failed to convert transaction')
+          }
+        : null
+
+      yield {
+        hold: false,
+        date,
+        movements: [
+          {
+            id: String(_.get(transaction, 'id')),
+            account: { id: cardId },
+            sum,
+            fee: 0,
+            invoice
+          }
+        ],
+        merchant,
+        comment,
+        ...(groupKeys !== undefined ? { groupKeys } : {})
       }
-    })
+    } catch (e) {
+      console.error('Failed to convert BSB transaction', { id: _.get(transaction, 'id'), paymentType: _.get(transaction, 'paymentType') })
+      throw e
+    }
+  }
 }
 
-function parseDate (dateString: string): Date {
-  // Parse format "05/09/2025 20:34:15" -> MM/DD/YYYY HH:mm:ss
+const TIMEZONE = 3
+
+export function parseDate (dateString: string): Date {
   const [datePart, timePart] = dateString.split(' ')
   const [day, month, year] = datePart.split('/').map(Number)
   const [hours, minutes, seconds] = timePart.split(':').map(Number)
 
-  return new Date(year, month - 1, day, hours, minutes, seconds)
+  return new Date(Date.UTC(year, month - 1, day, hours - TIMEZONE, minutes, seconds))
 }

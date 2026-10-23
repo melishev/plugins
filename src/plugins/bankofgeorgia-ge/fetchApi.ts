@@ -133,6 +133,9 @@ export async function fetchLogIn (preferences: Preferences,
   if (errorKey === 'INVALID_USERNAME_OR_PASSWORD') {
     throw new InvalidLoginOrPasswordError()
   }
+  if (errorKey === 'USER_IS_LOCKED') {
+    throw new BankMessageError(getOptString(response, 'extensions.errorMessage') ?? 'User is locked')
+  }
   return { processReference: getString(response, 'loginServices.login.processReference') }
 }
 
@@ -413,7 +416,7 @@ async function fetchOperationsApi (params: Record<string, unknown>,
     }
   }
 
-  const response = await fetch(`https://ibank.bog.ge/rest/operations?${qs.stringify(query)}`, {
+  const response = await fetch(`https://ibank.bog.ge/rest/transactional/statements?${qs.stringify(query)}`, {
     method: 'GET',
     headers: {
       'User-Agent': 'okhttp/4.5.0',
@@ -485,6 +488,19 @@ export async function fetchLoans (session: Session): Promise<FetchedLoanDeposit[
     const details = loansDetails.find(x => getNumber(x, 'loanKey') === acctKey)
     assert(details != null, 'cant find matching detail with acctKey', acctKey, 'from', loansDetails)
     return { tag: 'loan', product, details }
+  })
+}
+
+export async function fetchCreditCards (session: Session): Promise<FetchedChecking[]> {
+  const response = await fetchApiConnector('CARDS_GET_CREDITCARD_ACCOUNTS_AND_DETAILS', {}, session)
+  const accounts = getArray(response, 'result.cardsContainer.accounts')
+  const accountsDetails = getArray(response, 'result.details')
+
+  return accounts.map(product => {
+    const acctKey = getNumber(product, 'acctKey')
+    const details = accountsDetails.find(x => getNumber(x, 'acctKey') === acctKey)
+    assert(details != null, 'cant find matching detail with acctKey', acctKey, 'from', accountsDetails)
+    return { tag: 'creditCard', product, details, cards: [] }
   })
 }
 

@@ -5,6 +5,11 @@ export interface Auth {
   cookie: string
 }
 
+export interface LegalEntitySession {
+  legalEntity: LegalEntity
+  auth: Auth
+}
+
 // Input preferences from schema in preferences.xml
 export interface Preferences {
   login: string
@@ -17,6 +22,22 @@ export interface RaiffAccount extends AccountOrCard {
 
 export type AuthTicket = string
 export type LegalEntitiesTicket = string
+
+export interface GetLegalEntitiesResponse {
+  Success: boolean
+  Ticket: LegalEntitiesTicket
+  LastSuccessfulLogon: string | null
+  PinMustBeChanged: boolean
+  ForceSecondLogin?: boolean
+  SecurityUserID?: number
+  AdditionalAuthenticationType?: string[]
+  PrincipalData?: LegalEntity[]
+  FailedAttempts?: number | null
+  WrongPassword?: string | null
+  UserTempBlocked?: string | null
+  UserBlocked?: string | null
+  TempBlockPeriodInMinutes?: number | null
+}
 
 export interface LegalEntitiesResponse {
   Success: boolean

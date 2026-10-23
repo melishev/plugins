@@ -113,11 +113,7 @@ function pickDocuments ({ mimeTypes, allowMultipleSelection }, callback) {
       const blobs = await Promise.all(message.payload.files.map(async (file) => {
         const buffer = await file.arrayBuffer()
         const bytes = new Uint8Array(buffer)
-        file._getId = () => null
-        file._getType = () => file.type
-        file._getSize = () => bytes.length
-        file._getBytes = () => bytes
-        return new ZenMoney.Blob([file], { type: file.type })
+        return new ZenMoney.Blob([bytes], { type: file.type })
       }))
       callback(null, blobs)
     } catch (err) {
@@ -151,7 +147,8 @@ function ZPAPI ({ manifest, preferences, data }) {
     binaryRequestBody: true,
     binaryResponseBody: true,
     investmentAccount: true,
-    networkCallbacks: true
+    networkCallbacks: true,
+    webViewCA: true
   }
   const knownAccounts = {}
   const addedAccounts = []
@@ -169,6 +166,7 @@ function ZPAPI ({ manifest, preferences, data }) {
   this.setAuthentication = notImplemented
   this.clearAuthentication = notImplemented
   this.getCookie = notImplemented
+  this.trustCertificates = () => {}
 
   const pluginDataApi = makePluginDataApi(data)
   Object.assign(this, pluginDataApi.methods)

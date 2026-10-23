@@ -35,7 +35,8 @@ function parseBalance (text: string): Amount {
     /Доступно\s+на\s+(\d{2}[-./]\d{2}[-./]\d{2,4}):\s*(?:\+\s)?(-?[\d\s.,]*\d)\s*([а-яА-Яa-zA-Z]{1,3}|\W)/,
     /Card\s+balance\s+(\d{2}[-./]\d{2}[-./]\d{2,4}):\s*(?:\+\s)?(-?[\d\s.,]*\d)\s*([а-яА-Яa-zA-Z]{1,3}|\W)/,
     /(\d{2}[-./]\d{2}[-./]\d{2,4})ж. қолжетімді:\s*(?:\+\s)?(-?[\d\s.,]*\d)\s*([а-яА-Яa-zA-Z]{1,3}|\W)/,
-    /На\s+Депозите\s*(\d{2}[-./]\d{2}[-./]\d{2,4}):\s*(?:\+\s)?(-?[\d\s.,]*\d)\s*([а-яА-Яa-zA-Z]{1,3}|\W)/
+    /На\s+Депозите\s*(\d{2}[-./]\d{2}[-./]\d{2,4}):\s*(?:\+\s)?(-?[\d\s.,]*\d)\s*([а-яА-Яa-zA-Z]{1,3}|\W)/,
+    /Краткое\s+содержание\s+операций\s+по\s+депозиту:[\s\S]*На\s+Депозите\s+(\d{2}[-./]\d{2}[-./]\d{2,4})\s+(?:\+\s)?(-?[\d\s.,]*\d)\s*([а-яА-Яa-zA-Z]{1,3}|\W)\s*Дата\s*Сумма/
   ], text)
   if (match?.[2] !== undefined) {
     const amountStr = [
@@ -91,9 +92,18 @@ function getDepositEndDate (text: string): string {
 
 function getDepositCapitalizationInfo (text: string): string {
   const match = getRegexpMatch([
-    /вознаграждения:(\d+%)/
+    /вознаграждения:\s*(\d+%)/
   ], text)
   return match?.[1] != null ? match?.[1] : ''
+}
+
+function getDepositContractNumber (text: string): string | null {
+  const match = getRegexpMatch([
+    /Номер договора:\s*([A-Z0-9-]+)/,
+    /Келісімшарт нөмірі:\s*([A-Z0-9-]+)/,
+    /Contract number:\s*([A-Z0-9-]+)/
+  ], text)
+  return (match?.[1]) != null ? match[1] : null
 }
 
 function parseInstrument (text: string): string {
@@ -162,6 +172,12 @@ function parseAccountTitle (text: string, type: string): string {
     }
   }
   let title = titleByTypeAndLocale[locale as keyof AccountTypeByLocale][type as keyof AccountTypeHash]
+  if (type === 'deposit') {
+    const contractNumber = getDepositContractNumber(text)
+    if (contractNumber != null) {
+      return `${title} ${contractNumber}`
+    }
+  }
   const matchAccountNumber = getRegexpMatch([
     /Номер карты:\s?(\*\d+)/,
     /Карта нөмірі:\s?(\*\d+)/,
@@ -177,7 +193,7 @@ function parseAccountTitle (text: string, type: string): string {
 
 function parseDepositTransactions (text: string, statementUid: string): StatementTransaction[] {
   const headerStringByLocale = {
-    ru: /Дата\s?Сумма\s?Операция\s?Детали\s?На Депозите/
+    ru: /Дата\s*Сумма\s*Операция\s*Детали\s*На\s*Депозите/
   }
   const headerMatch = text.match(headerStringByLocale.ru)
   assert(headerMatch?.[0] != null, 'Can\'t find header for deposit account')
@@ -185,10 +201,63 @@ function parseDepositTransactions (text: string, statementUid: string): Statemen
   assert(startIndex >= 0, 'Can\'t parse transactions for deposit account')
   text = text.slice(startIndex)
   const pages = text.split(headerStringByLocale.ru).filter(str => str !== '')
-  const transactionRegExp = /^(\d{2}\.\d{2}\.\d{2})\s?([-+]\s?[$\d\s.,]+)?\s?([^а-яА-Я]*[^$\d]+)\s?((\$?\d{1,3}\s?){1}(\d{3}\s?)*,\d{2}(\s₸)?)?/
+  const transactionLineRegExp = /^\d{2}\.\d{2}\.\d{2}.+$/gm
+  const depositOperationPrefixes = [
+    'Пополнение',
+    'Перевод',
+    'Вознаграждение',
+    'Разное',
+    'Платежи',
+    'Снятия'
+  ]
+  const parseDepositLine = (line: string, descriptionFallback: string | null): StatementTransaction | null => {
+    const dateMatch = line.match(/^(\d{2}\.\d{2}\.\d{2})/)
+    if (dateMatch == null) {
+      return null
+    }
+    let rest = line.slice(dateMatch[0].length)
+    rest = rest.trimStart()
+    const amountMatch = rest.match(/^([+-])\s*([$\d\s.,]+)/)
+    let amount = ''
+    if (amountMatch != null) {
+      const sign = amountMatch[1]
+      const amountRaw = amountMatch[2].trim()
+      amount = `${sign} ${amountRaw}`
+      rest = rest.slice(amountMatch[0].length).trim()
+      rest = rest.replace(/^₸\s?/, '').trim()
+    }
+    const balanceMatch = rest.match(/(\$?\d[\d\s]*,\d{2}(?:\s?₸)?)$/)
+    if (balanceMatch != null) {
+      rest = rest.slice(0, rest.length - balanceMatch[1].length).trim()
+    }
+    let description = rest.trim()
+    if (description === '') {
+      description = descriptionFallback ?? ''
+    }
+    if (description !== '') {
+      for (const prefix of depositOperationPrefixes) {
+        if (description.startsWith(prefix) && description.length > prefix.length && description[prefix.length] !== ' ') {
+          description = `${prefix} ${description.slice(prefix.length)}`
+          break
+        }
+      }
+    }
+    if (amount === '' && /Продление депозита/i.test(description)) {
+      return null
+    }
+    return {
+      hold: false,
+      date: parseDateFromPdfText(line),
+      originalAmount: null,
+      amount,
+      description: description === '' ? null : description,
+      statementUid,
+      originString: line
+    }
+  }
   const result: StatementTransaction[] = []
   for (const page of pages) {
-    const transactionStrings = page.match(new RegExp(transactionRegExp, 'gm'))
+    const transactionStrings = page.match(transactionLineRegExp)
     /*
     * Descriptions for transactions are separate and may be split into lines.
     * Should check the coincidence of the number of transactions and descriptions.
@@ -198,44 +267,25 @@ function parseDepositTransactions (text: string, statementUid: string): Statemen
     try {
       commentStrings = page
         .replace(headerStringByLocale.ru, '')
-        .replace(new RegExp(transactionRegExp, 'gm'), '')
+        .replace(transactionLineRegExp, '')
         .trim()
         .split('\n')
-      if ((commentStrings.length > 0) && transactionStrings !== null && commentStrings.length === (2 * transactionStrings.length)) {
+      if (commentStrings.length > 0 && commentStrings.length % 2 === 0) {
         const pairs = chunk(commentStrings, 2)
         commentStrings = pairs.map(pair => pair.join(' ').trim())
-      } else {
-        commentStrings = []
       }
     } catch (e) {
       console.log(e)
     }
     if ((transactionStrings?.length) != null) {
-      transactionStrings.map((str, index) => {
-        const match = str.match(new RegExp(transactionRegExp, 'm'))
-        /*
-        * some transactions in statement comes without sum, should skip it
-        * */
-        if (match?.[2] == null) {
-          return str
+      transactionStrings.forEach((str, index) => {
+        const fallback = transactionStrings.length === commentStrings.length && (!['', undefined, null].includes(commentStrings[index]))
+          ? commentStrings[index]
+          : null
+        const item = parseDepositLine(str, fallback)
+        if (item !== null) {
+          result.push(item)
         }
-        const description = (match?.[3]) != null ? match[3] : null
-        assert(match !== null, 'Can\'t parse transaction ', str)
-        const item = {
-          hold: false,
-          date: parseDateFromPdfText(str),
-          originalAmount: null,
-          amount: match[2],
-          description: description === null
-            ? commentStrings.length > 0 && (!['', undefined, null].includes(commentStrings[index]))
-              ? commentStrings[index]
-              : null
-            : description,
-          statementUid,
-          originString: match[0]
-        }
-        result.push(item)
-        return item
       })
     }
   }
@@ -251,12 +301,13 @@ function parseTransactions (text: string, accountType: string, statementUid: str
   let baseRegexp: RegExp
   let originalAmountRegExpIndex = 5
   let descriptionRegExpIndex = 4
+  const originalAmountPattern = '(\\(\\s*[-+]?\\s?[\\d\\s.,]+\\s?[A-Z]{3}\\))?'
   if (locale === 'en') {
-    baseRegexp = /^(\d{2}\.\d{2}\.\d{2})\s*([+-]\s?[\d\s.,]+)\s*\W+(\w+)\s+(.+)\s?(\([-+]?[\d.,]+\s?[A-Z]{3}\))?/
+    baseRegexp = new RegExp(`^(\\d{2}\\.\\d{2}\\.\\d{2})\\s*([+-]\\s?[\\d\\s.,]+)\\s*\\W+(\\w+)\\s+(.+)\\s?${originalAmountPattern}`)
   } else if (locale === 'ru') {
-    baseRegexp = /^(\d{2}\.\d{2}\.\d{2})\s*([+-]\s?[\d\s.,]+)\s*[^а-яА-Я]+([а-яА-Я]+)\s+(.+)\s?(\([-+]?[\d.,]+\s?[A-Z]{3}\))?/
+    baseRegexp = new RegExp(`^(\\d{2}\\.\\d{2}\\.\\d{2})\\s*([+-]\\s?[\\d\\s.,]+)\\s*[^а-яА-Я]+([а-яА-Я]+)\\s+(.+)\\s?${originalAmountPattern}`)
   } else {
-    baseRegexp = /^(\d{2}\.\d{2}\.\d{2})\s*([+-]\s?[\d\s.,]+)\s*[^а-яА-Я\s]+\s{2,}((\S+\s)+)\s{2,}((\S+ {0,2})+)(\s\([^)]+\))?/
+    baseRegexp = /^(\d{2}\.\d{2}\.\d{2})\s*([+-]\s?[\d\s.,]+)\s*[^а-яА-Я\s]+\s{2,}((\S+\s)+)\s{2,}((\S+ {0,2})+)(\s\(\s*[-+]?\s?[\d\s.,]+\s?[A-Z]{3}\))?/
     originalAmountRegExpIndex = 7
     descriptionRegExpIndex = 5
   }
@@ -304,6 +355,18 @@ export function parseSinglePdfString (text: string, statementUid?: string): { ac
   return parsedContent
 }
 
+export async function readPdfTextsSequentially (
+  blobs: Blob[],
+  readPdf: typeof parsePdf = parsePdf
+): Promise<string[]> {
+  const pdfStrings: string[] = []
+  for (const blob of blobs) {
+    const { text } = await readPdf(blob)
+    pdfStrings.push(text)
+  }
+  return pdfStrings
+}
+
 async function showHowTo (): Promise<ObjectWithAnyProps> {
   let result
   if (ZenMoney.getData('showHowTo') !== false) {
@@ -324,6 +387,23 @@ async function showHowTo (): Promise<ObjectWithAnyProps> {
   return { shouldPickDocs: result }
 }
 
+export function isKaspiStatement (text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ')
+  const hasStatementMarkers = /(ВЫПИСКА|ҮЗІНДІ КӨШІРМЕ|statement balance for the period|По Депозиту|Kaspi Gold)/i.test(normalized)
+  if (!hasStatementMarkers) {
+    return false
+  }
+  if (/Kaspi Bank|kaspi\.kz/i.test(normalized)) {
+    return true
+  }
+
+  // Some Kaspi deposit PDFs do not include bank name or kaspi.kz in extracted text.
+  return /По\s+Депозиту\s+за\s+период/i.test(normalized) &&
+    /Номер\s+договора/i.test(normalized) &&
+    /Номер\s+счета/i.test(normalized) &&
+    /На\s+Депозите/i.test(normalized)
+}
+
 export async function parsePdfStatements (): Promise<null | Array<{ account: StatementAccount, transactions: StatementTransaction[] }>> {
   await showHowTo()
   const blob = await ZenMoney.pickDocuments(['application/pdf'], true)
@@ -337,14 +417,11 @@ export async function parsePdfStatements (): Promise<null | Array<{ account: Sta
       throw new TemporaryError('Максимальный размер файла - 1 мб')
     }
   }
-  const pdfStrings = await Promise.all(blob.map(async (blob) => {
-    const { text } = await parsePdf(blob)
-    return text
-  }))
+  const pdfStrings = await readPdfTextsSequentially(blob)
   const result = []
   for (const textItem of pdfStrings) {
     console.log(textItem)
-    if (!/Kaspi Bank/i.test(textItem)) {
+    if (!isKaspiStatement(textItem)) {
       throw new TemporaryError('Похоже, это не выписка Kaspi')
     }
     try {

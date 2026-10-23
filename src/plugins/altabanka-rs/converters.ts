@@ -1,5 +1,6 @@
-import { AccountOrCard, AccountType, ExtendedTransaction } from '../../types/zenmoney'
-import { AccountInfo, AccountTransaction } from './types'
+import { AccountOrCard, AccountType, ExtendedTransaction, Transaction } from '../../types/zenmoney'
+import { AccountInfo, AccountTransaction } from './models'
+import { getOptNumber, getOptString } from '../../types/get'
 
 export function convertAccounts (apiAccounts: AccountInfo[]): AccountOrCard[] {
   return apiAccounts.map(apiAccount => {
@@ -17,30 +18,31 @@ export function convertAccounts (apiAccounts: AccountInfo[]): AccountOrCard[] {
 }
 
 export function convertTransaction (accountTransaction: AccountTransaction, account: AccountInfo, hold = false): ExtendedTransaction | null {
-  accountTransaction.currency = accountTransaction.currency === undefined
-    ? 'RSD'
-    : accountTransaction.currency
+  const currency = accountTransaction.currency ?? 'RSD'
 
   if (accountTransaction.amount === 0) {
     return null
   }
+
+  const match = accountTransaction.description.match(/^([\d.]+)\s(\w{3})/)
+
   let invoice = {
     sum: accountTransaction.amount,
-    instrument: accountTransaction.currency
+    instrument: currency
   }
-  const match = accountTransaction.description.match(/^([\d.]+)\s(\w{3})/)
-  if (match != null) {
+  if (accountTransaction.invoice != null) {
+    // Card transaction: domestic `amount` plus the original-currency invoice.
+    invoice = accountTransaction.invoice
+  } else if (match != null) {
     invoice = {
       sum: accountTransaction.amount < 0 ? -parseFloat(match[1]) : parseFloat(match[1]),
       instrument: match[2]
     }
   }
 
-  const merchant = {
-    fullTitle: accountTransaction.address,
-    mcc: null,
-    location: null
-  }
+  const foreign = invoice.instrument !== account.currency
+  // Card transactions carry the domestic amount, so we keep `sum` even for foreign currency.
+  const sum = accountTransaction.invoice != null ? accountTransaction.amount : (foreign ? null : accountTransaction.amount)
 
   const transaction: ExtendedTransaction = {
     hold,
@@ -49,23 +51,26 @@ export function convertTransaction (accountTransaction: AccountTransaction, acco
       {
         id: accountTransaction.id,
         account: { id: account.id },
-        sum: invoice?.instrument !== account.currency ? null : accountTransaction.amount,
+        sum,
         fee: 0,
-        invoice: invoice?.instrument === account.currency ? null : invoice
+        invoice: foreign ? invoice : null
       }
     ],
-    merchant,
+    merchant: null,
     comment: accountTransaction.description !== '' && (match == null) ? accountTransaction.description : null
   };
   [
-    parseCashTransfer
+    parseCashTransfer,
+    parseInnerTransfer,
+    parsePayeeAndComment
   ].some(parser => parser(transaction, accountTransaction, account, invoice))
   return transaction
 }
 
 function parseCashTransfer (transaction: ExtendedTransaction, accountTransaction: AccountTransaction, account: AccountInfo, invoice: { sum: number, instrument: string }): boolean {
   if ([
-    /ATM/
+    /ATM/,
+    /Gotovinska/i
   ].some(regexp => regexp.test(accountTransaction.address))) {
     transaction.movements.push({
       id: null,
@@ -79,7 +84,93 @@ function parseCashTransfer (transaction: ExtendedTransaction, accountTransaction
       sum: -invoice.sum,
       fee: 0
     })
+  }
+  return false
+}
+
+function parseInnerTransfer (transaction: ExtendedTransaction, accountTransaction: AccountTransaction, account: AccountInfo, invoice: { sum: number, instrument: string }): boolean {
+  if ([
+    /Interni transfer/i,
+    /Kupovina deviza/i
+  ].some(regex => regex.test(accountTransaction.address))) {
+    transaction.merchant = null
+    transaction.comment = accountTransaction.address
+
     return true
   }
   return false
+}
+
+function parsePayeeAndComment (transaction: ExtendedTransaction, accountTransaction: AccountTransaction, account: AccountInfo, invoice: { sum: number, instrument: string }): boolean {
+  transaction.merchant = {
+    fullTitle: accountTransaction.address,
+    mcc: null,
+    location: null
+  }
+  if ([
+    /Uplata/i,
+    /Gotovinska/i
+  ].some(regex => regex.test(accountTransaction.address))) {
+    transaction.merchant = null
+    transaction.comment = accountTransaction.address
+  }
+  return false
+}
+
+export function deduplicateTransactions (transactions: Transaction[]): Transaction[] {
+  // Prefer posted when hold and posted share the same movement id (canonical card reference).
+  const byId = new Map<string, Transaction>()
+  const withoutId: Transaction[] = []
+
+  for (const transaction of transactions) {
+    const id = transaction.movements[0]?.id
+    if (typeof id !== 'string') {
+      withoutId.push(transaction)
+      continue
+    }
+    const existing = byId.get(id)
+    if (existing == null) {
+      byId.set(id, transaction)
+      continue
+    }
+    if (existing.hold === true && transaction.hold !== true) {
+      byId.set(id, transaction)
+    }
+  }
+
+  const result = [...byId.values(), ...withoutId]
+  // Soft fallback for pairs that still use different movement ids.
+  for (let i = 0; i < result.length; ++i) {
+    for (let j = i + 1; j < result.length; ++j) {
+      const leftKey = getDeduplicationKey(result[i])
+      const rightKey = getDeduplicationKey(result[j])
+      if (leftKey !== null && leftKey === rightKey) {
+        result[i].hold = false
+        result.splice(j--, 1)
+      }
+    }
+  }
+  return result
+}
+
+function getDeduplicationKey (transaction: Transaction): string | null {
+  if (transaction.movements.length !== 1) {
+    return null
+  }
+  const movement = transaction.movements[0]
+  const accountId = getOptString(movement.account, 'id')
+  const sum = getOptNumber(movement, 'sum')
+  if (accountId === undefined || sum === undefined) {
+    return null
+  }
+  return JSON.stringify({
+    year: transaction.date.getFullYear(),
+    month: transaction.date.getMonth(),
+    day: transaction.date.getDate(),
+    hour: transaction.date.getHours(),
+    accountId,
+    sum,
+    merchant: transaction.merchant,
+    comment: transaction.comment
+  })
 }

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<provider>
+    <id>basisbank-ge</id>
+    <company>16011</company>
+    <codeRequired>false</codeRequired>
+    <description>
+        BasisBank Internet Banking synchronization plugin (user flow).
+        Uses login/password with OTP and trusted-device session persistence.
+    </description>
+</provider>

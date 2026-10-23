@@ -1,106 +1,196 @@
-import { FetchResponse, fetch } from '../../common/network'
-import { InvalidLoginOrPasswordError } from '../../errors'
-import { AccountDetails, Preferences } from './models'
+import { fetch, FetchResponse } from '../../common/network'
+import { delay } from '../../common/utils'
+import { BankMessageError, InvalidLoginOrPasswordError, TemporaryError } from '../../errors'
+import { AccountInfo, AccountTransaction, Preferences } from './models'
+import { parseAccountInfo, parseHiddenFields, parseLoginStep, parseRequestVerificationToken, parseTransactions } from './parsers'
+import { sanitize } from '../../common/sanitize'
+import moment from 'moment'
+// @ts-expect-error no types for package
+import * as qs from 'querystring-browser'
 
-const baseUrl = 'https://hb.posted.co.rs/posted/en/'
+const baseUrl = 'https://onlinebanking.posted.co.rs/webapp/'
+// The bank keeps a push open for about three minutes.
+const PUSH_APPROVAL_TIMEOUT_MS = 175000
+const PUSH_POLL_INTERVAL_MS = 2000
 
-async function fetchUrl (url: string, options: Record<string, unknown>): Promise<FetchResponse> {
-  const response = await fetch(baseUrl + url, {
-    ...options,
-    ...{
-      sanitizeResponseLog: { headers: { 'set-cookie': true } },
+async function postLoginForm (fields: Record<string, string>, sanitizeRequestLog = false): Promise<string> {
+  const response = await fetch(
+    baseUrl + 'Identity/Login',
+    {
+      method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
-      }
-    }
-  }) as FetchResponse & { headers: Record<string, string> }
-
-  return response
+        'content-type': 'application/x-www-form-urlencoded',
+        'X-Requested-With': 'XMLHttpRequest'
+      },
+      body: qs.stringify({ ...fields, 'X-Requested-With': 'XMLHttpRequest' }),
+      sanitizeRequestLog
+    }) as FetchResponse & { body: string }
+  return response.body
 }
 
+async function fetchCallbackStatus (workItemId: string): Promise<{ Success?: boolean, Rejected?: boolean }> {
+  const response = await fetch(
+    `${baseUrl}Identity/Login/CallbackStatus?workItemId=${encodeURIComponent(workItemId)}&_=${Date.now()}`,
+    {
+      method: 'GET',
+      headers: { 'X-Requested-With': 'XMLHttpRequest', Accept: 'application/json' }
+    }) as FetchResponse & { body: string }
+  try {
+    return typeof response.body === 'string' ? JSON.parse(response.body) : response.body
+  } catch (e) {
+    return {}
+  }
+}
+
+// Since 2026 the bank asks for a second factor after the password. Of the
+// three it offers (SMS code, mToken Push, QR) the plugin uses mToken Push:
+// the user taps the notification in the mToken Asseco app and nothing has to
+// be typed into Zenmoney. The page then asks CallbackStatus about once a
+// second until it answers Success, and submits its form once more.
 export async function fetchAuthorization ({ login, password }: Preferences): Promise<void> {
-  if ('trustCertificates' in ZenMoney) {
-    // Expires: Wednesday, 22 January 2025
-    ZenMoney.trustCertificates(['-----BEGIN CERTIFICATE-----\n' +
-  'MIIG8DCCBdigAwIBAgIQCZEMca4TANvyAKqemQblITANBgkqhkiG9w0BAQsFADBZ\n' +
-'MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMTMwMQYDVQQDEypE\n' +
-'aWdpQ2VydCBHbG9iYWwgRzIgVExTIFJTQSBTSEEyNTYgMjAyMCBDQTEwHhcNMjMx\n' +
-'MjIyMDAwMDAwWhcNMjUwMTIxMjM1OTU5WjCBgDELMAkGA1UEBhMCUlMxETAPBgNV\n' +
-'BAcTCEJlbGdyYWRlMUQwQgYDVQQKDDtCYW5rYSBQb8WhdGFuc2thIMWhdGVkaW9u\n' +
-'aWNhLCBha2Npb25hcnNrbyBkcnXFoXR2bywgQmVvZ3JhZDEYMBYGA1UEAxMPaGIu\n' +
-'cG9zdGVkLmNvLnJzMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6nJ9\n' +
-'MIRcIOEfriQthK8pJqLwGlv/ccMxENou+6/TKk5M2zM5Cit8d9Xdf3p1iVZc6IF+\n' +
-'uBPuN15ZuEJQI6iDqHZlQ3P/DinkH8ChLaOFu9su94jyO/t8W42IZQetwygGXUDl\n' +
-'8xtbCl9adlvnmsOiWX8X4MMV+Rho69SI3Ifj2MbqDETtgVuLzK7uuuediYMxru4h\n' +
-'wCxEI/BNi7BC0mQPOGivjnSg1Irr4k4PV6wg2BglXc8uW6mqktsxmK8NgcGGnh0Y\n' +
-'/P3uqRz2uerp/6o1XWUaqEyf4Cq3bpgLaencEfF7Ihvgkn02r7An/MBmsY+ZiqWR\n' +
-'YyPzs6079qhm18SX/wIDAQABo4IDijCCA4YwHwYDVR0jBBgwFoAUdIWAwGbH3zfe\n' +
-'z70pN6oDHb7tzRcwHQYDVR0OBBYEFIibQyvLDwZrUjt3VpYcv2pX+b0MMBoGA1Ud\n' +
-'EQQTMBGCD2hiLnBvc3RlZC5jby5yczA+BgNVHSAENzA1MDMGBmeBDAECAjApMCcG\n' +
-'CCsGAQUFBwIBFhtodHRwOi8vd3d3LmRpZ2ljZXJ0LmNvbS9DUFMwDgYDVR0PAQH/\n' +
-'BAQDAgWgMB0GA1UdJQQWMBQGCCsGAQUFBwMBBggrBgEFBQcDAjCBnwYDVR0fBIGX\n' +
-'MIGUMEigRqBEhkJodHRwOi8vY3JsMy5kaWdpY2VydC5jb20vRGlnaUNlcnRHbG9i\n' +
-'YWxHMlRMU1JTQVNIQTI1NjIwMjBDQTEtMS5jcmwwSKBGoESGQmh0dHA6Ly9jcmw0\n' +
-'LmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydEdsb2JhbEcyVExTUlNBU0hBMjU2MjAyMENB\n' +
-'MS0xLmNybDCBhwYIKwYBBQUHAQEEezB5MCQGCCsGAQUFBzABhhhodHRwOi8vb2Nz\n' +
-'cC5kaWdpY2VydC5jb20wUQYIKwYBBQUHMAKGRWh0dHA6Ly9jYWNlcnRzLmRpZ2lj\n' +
-'ZXJ0LmNvbS9EaWdpQ2VydEdsb2JhbEcyVExTUlNBU0hBMjU2MjAyMENBMS0xLmNy\n' +
-'dDAMBgNVHRMBAf8EAjAAMIIBfQYKKwYBBAHWeQIEAgSCAW0EggFpAWcAdQBOdaMn\n' +
-'XJoQwzhbbNTfP1LrHfDgjhuNacCx+mSxYpo53wAAAYyRzfryAAAEAwBGMEQCIGza\n' +
-'Os35Je90dCHyLaEqrhY7cFBRl5MNG4yxKW5Y++7/AiBbPeN9/SeX4YiOkdKacKZy\n' +
-'zu2T+5gfUBUkVdMb5TempgB2AH1ZHhLheCp7HGFnfF79+NCHXBSgTpWeuQMv2Q6M\n' +
-'Lnm4AAABjJHN+xoAAAQDAEcwRQIgEVkfWOq8K3y6Y1yj4QgDsC74ZfrBgIaSGdPy\n' +
-'ItSS6e8CIQDq6BBLlAXL8SIE1C6e9UGDvrTlPrqw2rw4KJOBisvhHwB2AObSMWNA\n' +
-'d4zBEEEG13G5zsHSQPaWhIb7uocyHf0eN45QAAABjJHN+z4AAAQDAEcwRQIgds6p\n' +
-'ATMLxRqMdaeA3v0fZGlKDLA8+p/OarKSXuYJVngCIQD9nejKrh8cZJ3pTIIKvo4g\n' +
-'p927IpIUtytCMPj0LqNwlDANBgkqhkiG9w0BAQsFAAOCAQEAEKcAQE/BKG0FO9rI\n' +
-'EzKhzPXmLJOGJOqUYyVpufedaFZUja5vzjQnRARaJVUtVfPvYWnpwKHwIZXimDwD\n' +
-'sA1LAKDNbvUM2p+faEXRD1zuNbvlq9ONWj9T0uSxSqlMtc+tA94YTb+fk//h28xs\n' +
-'+MewZb66NSxH6NslE/XhpiTDuV8k0zOsFmZhC6xmNhB2A3KodX6kFfq6xOqD7pE3\n' +
-'Ty7wje3T76s1u6ZPzNh6un6QY1XMNEAe8xqdJS8dI6aYKINAXESG879nP6yy7xVi\n' +
-'yiLED9/J8asAg527yi6ANxNZ15CtTXktzxwJ5XE4GyKVZ1Fx8+kl80Nu5SyZ5gD4\n' +
-'tGKeqA==\n' +
-  '-----END CERTIFICATE-----'
-    ])
+  const loginPage = await fetch(baseUrl + 'Identity/Login', undefined) as FetchResponse & { body: string }
+  const start = parseHiddenFields(loginPage.body)
+  if (start.workitemid === undefined || start.workitemid === '') {
+    throw new TemporaryError('Failed to load login page')
   }
 
-  const response = await fetchUrl('index.jsp', {
-    method: 'POST',
-    body: `korisnik=${login}&lozinka=${password}`
-  }) as FetchResponse & { headers: Record<string, string> }
-
-  if ((response.body as string).includes('<div class=error>')) {
+  const pushForm = await postLoginForm({ ...start, ActiveLoginMethod: 'usernamepush', ChangeLoginMethod: 'ChangeLoginMethod' })
+  const devices = await postLoginForm({ ...parseHiddenFields(pushForm), Username_ID: login, Password_ID: password, 1: '' }, true)
+  const devicesStep = parseLoginStep(devices)
+  if (devicesStep.kind === 'credentials') {
     throw new InvalidLoginOrPasswordError()
   }
-}
-
-export async function fetchAllAccounts (): Promise<AccountDetails[]> {
-  const response = await fetchUrl('fracld.jsp?NF=1356', {
-    method: 'POST'
-  })
-
-  const string = response.body as string
-  const regexp = /(\d\d\d\d\d)\s+(\d\d\d\d\d\d\d\d\d)(\d)/g
-
-  const matches = string.matchAll(regexp)
-
-  const accounts: AccountDetails[] = []
-  for (const match of matches) {
-    const [, , accountId, accountType] = match
-    accounts.push({
-      id: Number(accountId),
-      type: Number(accountType)
-    })
+  if (devicesStep.kind !== 'devices') {
+    throw new BankMessageError('Login with mToken Push is not available. Activate mToken Asseco for online banking and try again.')
   }
 
-  return accounts
+  const waiting = await postLoginForm({ ...parseHiddenFields(devices), 1: '' })
+  const waitingStep = parseLoginStep(waiting)
+  if (waitingStep.kind !== 'waiting' || waitingStep.workItemId === undefined) {
+    throw new TemporaryError('The bank did not send the mToken push')
+  }
+
+  const deadline = Date.now() + PUSH_APPROVAL_TIMEOUT_MS
+  for (;;) {
+    const status = await fetchCallbackStatus(waitingStep.workItemId)
+    if (status.Success === true) {
+      break
+    }
+    if (status.Rejected === true) {
+      throw new BankMessageError('The login was rejected in mToken Asseco.')
+    }
+    if (Date.now() > deadline) {
+      throw new TemporaryError('The login was not confirmed in mToken Asseco in time')
+    }
+    await delay(PUSH_POLL_INTERVAL_MS)
+  }
+
+  await postLoginForm({ ...parseHiddenFields(waiting), 1: '' })
 }
 
-export async function fetchAccountData (account: AccountDetails): Promise<string> {
-  const response = await fetchUrl('racsta.jsp', {
-    method: 'POST',
-    body: `RACUNPSTIP=${account.type}&racun=${account.id}`
-  })
+export async function fetchAllAccounts (): Promise<AccountInfo[]> {
+  const response = await fetch(
+    baseUrl + 'Home/Accounts',
+    undefined
+  ) as FetchResponse & { body: string }
 
-  return response.body as string
+  const accountsInfo = parseAccountInfo(response.body)
+
+  console.debug('fetchAccounts', sanitize(accountsInfo, false))
+
+  return accountsInfo
+}
+
+export async function fetchVerificationToken (): Promise<string> {
+  const response = await fetch(
+    baseUrl + 'AccountData/Transactions/List',
+    undefined
+  ) as FetchResponse & { body: string }
+
+  const token = parseRequestVerificationToken(response.body)
+
+  console.debug('fetchVerificationToken', sanitize(token, true))
+
+  return token
+}
+
+export async function fetchTransactions (
+  accountId: string,
+  token: string,
+  page: number,
+  fromDate: Date,
+  toDate?: Date
+): Promise<AccountTransaction[]> {
+  const formData: Record<string, string> = {
+    Accounts_ID: accountId,
+    __RequestVerificationToken: token,
+    DateFrom_ID: moment(fromDate).format('DD/MM/YYYY'),
+    SortOrder_ID: 'asc',
+    PageSize: '100',
+    PageNumber: page.toString()
+  }
+  if (toDate != null) {
+    formData.DateTo_ID = moment(toDate).format('DD/MM/YYYY')
+  }
+
+  const response = await fetch(
+    baseUrl + 'AccountData/Transactions/List',
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded'
+      },
+      body: qs.stringify(formData)
+    }
+  ) as FetchResponse & { body: string }
+
+  const transactions = parseTransactions(response.body, fromDate, toDate ?? new Date())
+
+  console.debug('fetchTransactions', sanitize(transactions, false))
+
+  return transactions
+}
+
+export async function fetchCardTransactions (
+  accountId: string,
+  cardNumber: string,
+  token: string,
+  page: number,
+  fromDate: Date,
+  toDate?: Date
+): Promise<AccountTransaction[]> {
+  const formData: Record<string, string> = {
+    Accounts_ID: accountId,
+    __RequestVerificationToken: token,
+    DateFrom_ID: moment(fromDate).format('DD/MM/YYYY'),
+    SortOrder_ID: 'asc',
+    PageSize: '100',
+    PageNumber: page.toString(),
+    Statuses_ID: 'p'
+  }
+
+  if (toDate != null) {
+    formData.DateTo_ID = moment(toDate).format('DD/MM/YYYY')
+  }
+
+  if (cardNumber !== '') {
+    formData.Cards_ID = cardNumber
+  }
+
+  const response = await fetch(
+    baseUrl + 'AccountData/Transactions/CardTransactionsList',
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded'
+      },
+      body: qs.stringify(formData)
+    }
+  ) as FetchResponse & { body: string }
+
+  const transactions = parseTransactions(response.body, fromDate, toDate ?? new Date())
+
+  console.debug('fetchCardTransactions', sanitize(transactions, false))
+
+  return transactions
 }

@@ -1,9 +1,7 @@
-import pdfjs from 'pdfjs-dist'
+import 'pdfjs-dist/build/pdf.worker.entry'
 import pdf from 'pdf-extraction/lib/pdf-extraction'
 import { fetchJson } from './network'
 import { isDebug } from './utils'
-
-pdfjs.GlobalWorkerOptions.workerSrc = 'unexisting'
 
 const PDF_PARSER_URL = ''
 
@@ -60,7 +58,9 @@ async function pdfOrThrow (dataBuffer, options) {
 }
 
 export async function parsePdf (pdfBlob) {
-  const arrayBuffer = await pdfBlob.arrayBuffer()
+  const arrayBuffer = 'arrayBuffer' in pdfBlob
+    ? await pdfBlob.arrayBuffer()
+    : (await (typeof pdfBlob.bytes === 'function' ? pdfBlob.bytes() : pdfBlob.bytes)).buffer
 
   if (isDebug() && typeof global.WorkerGlobalScope !== 'undefined' && global.self instanceof global.WorkerGlobalScope) {
     console.log('parsePdf worker thread')

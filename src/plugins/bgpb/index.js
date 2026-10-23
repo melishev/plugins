@@ -1,19 +1,52 @@
 import _ from 'lodash'
 import { adjustTransactions } from '../../common/transactionGroupHandler'
+import { InvalidPreferencesError } from '../../errors'
 import {
-  fetchAccountConditions,
+  activateDeviceToken,
   fetchAccounts,
   fetchBalance,
   fetchFullTransactions,
   fetchLastTransactions,
   fetchTransactionsAccId,
   login,
-  parseTransactionsAndOverdraft
+  loginDeviceToken,
+  logoff,
+  parseTransactionsAndOverdraft,
+  registerDeviceToken
 } from './api'
-import { addOverdraftInfo, convertAccount, convertLastTransaction, convertTransaction, transactionsUnique } from './converters'
+import { addOverdraftInfo, convertAccount, convertLastTransaction, convertTransaction, mergeStatementAndLastTransactions } from './converters'
+import {
+  buildActivationDescriptor,
+  createDeviceIdentity,
+  createDeviceState,
+  generateDevicePin,
+  generateDeviceOtp,
+  hashAccountLogin,
+  openDeviceState,
+  sealDeviceState,
+  validateDevicePin
+} from './deviceOtp'
+
+const DEVICE_TOKEN_DATA_KEY = 'deviceOtp/v1'
+const DEVICE_PIN_DATA_KEY = 'deviceOtp/pin/v1'
+const DEVICE_PIN_DATA_VERSION = 1
+const ACTIVATION_CODE_TIMEOUT_MS = 180000
+const DEVICE_OTP_PERIOD_MS = 30000
+const DEVICE_OTP_BOUNDARY_GRACE_MS = 250
+const DEVICE_OTP_MAX_WAITS = 2
+const LEGACY_PIN_RECOVERY_ERROR = 'Не удалось открыть сохраненную активацию BGPB. Укажите прежний PIN токена в настройках для переноса.'
+
+/**
+ * Full mailbox statements provide complete history when device authorization is
+ * available. History API is merged separately for recent and pending operations.
+ */
+export function shouldFetchFullStatement (account, deviceBound) {
+  return Boolean(deviceBound && account.transactionsAccId)
+}
 
 export async function scrape ({ preferences, fromDate, toDate }) {
-  const token = await login(preferences.login, preferences.password)
+  const session = await initializeDeviceSession(preferences)
+  const token = session.sid
 
   let accounts = await allAccounts(token)
   if (accounts.length === 0) {
@@ -26,9 +59,9 @@ export async function scrape ({ preferences, fromDate, toDate }) {
 
   const transactionsStatement = []
   accounts = await Promise.all(accounts.map(async account => {
-    if (account.transactionsAccId) {
-      const mails = await fetchFullTransactions(token, account, fromDate, toDate)
-      const { overdraft, transactions } = parseTransactionsAndOverdraft(mails)
+    if (shouldFetchFullStatement(account, session.deviceBound)) {
+      const mails = await fetchFullTransactions(token, account, fromDate, toDate, session.getDeviceAuthorization)
+      const { overdraft, transactions } = parseTransactionsAndOverdraft(mails, account)
       account = addOverdraftInfo(account, overdraft)
       for (const apiTransaction of transactions) {
         const transaction = convertTransaction(apiTransaction, account)
@@ -40,7 +73,7 @@ export async function scrape ({ preferences, fromDate, toDate }) {
     return account
   }))
 
-  const transactionsLast = (await fetchLastTransactions(token))
+  const transactionsLast = (await fetchLastTransactions(token, accounts, fromDate, toDate))
     .map(transaction => convertLastTransaction(transaction, accounts))
     .filter(function (op) {
       if (op === null) {
@@ -52,11 +85,221 @@ export async function scrape ({ preferences, fromDate, toDate }) {
       }
       return true
     })
-  const transactions = transactionsUnique(transactionsStatement.concat(transactionsLast))
+  const transactions = mergeStatementAndLastTransactions(transactionsStatement, transactionsLast)
     .filter(transaction => transaction.movements[0].sum !== 0)
   return {
     accounts,
     transactions: adjustTransactions({ transactions: _.sortBy(transactions, transaction => transaction.date) })
+  }
+}
+
+async function readActivationCode () {
+  const code = await ZenMoney.readLine('Введите 8-значный код активации устройства BGPB', {
+    inputType: 'text',
+    time: ACTIVATION_CODE_TIMEOUT_MS
+  })
+  const normalized = String(code || '').trim()
+  if (normalized.length !== 8) {
+    throw new InvalidPreferencesError('Не введен корректный 8-значный код активации BGPB')
+  }
+  return normalized
+}
+
+function readStoredPinEntry (entry) {
+  if (!entry || typeof entry.accountHash !== 'string') {
+    return null
+  }
+  const pin = String(entry.pin || '').trim()
+  try {
+    validateDevicePin(pin)
+  } catch (_error) {
+    return null
+  }
+  return { accountHash: entry.accountHash, pin }
+}
+
+async function initializeDeviceSession (preferences) {
+  const expectedAccountHash = hashAccountLogin(preferences.login)
+  const storedEnvelope = ZenMoney.getData(DEVICE_TOKEN_DATA_KEY)
+  const storedPinData = ZenMoney.getData(DEVICE_PIN_DATA_KEY)
+  const activePinEntry = storedPinData?.version === DEVICE_PIN_DATA_VERSION
+    ? readStoredPinEntry(storedPinData.active)
+    : null
+  const pendingPinEntry = storedPinData?.version === DEVICE_PIN_DATA_VERSION
+    ? readStoredPinEntry(storedPinData.pending)
+    : null
+  const pendingPinForCurrentAccount = pendingPinEntry?.accountHash === expectedAccountHash
+  const legacyPin = String(preferences.appPin || '').trim()
+  const pinCandidates = []
+  if (activePinEntry) {
+    pinCandidates.push(activePinEntry.pin)
+  }
+  if (legacyPin && !pinCandidates.includes(legacyPin)) {
+    pinCandidates.push(legacyPin)
+  }
+
+  let pin = null
+  let state = null
+  let openedDifferentAccount = false
+  if (storedEnvelope && !pendingPinForCurrentAccount) {
+    for (const candidate of pinCandidates) {
+      try {
+        validateDevicePin(candidate)
+      } catch (_error) {
+        continue
+      }
+      let storedState
+      try {
+        storedState = openDeviceState(storedEnvelope, candidate)
+      } catch (error) {
+        if (error instanceof InvalidPreferencesError) {
+          continue
+        }
+        throw error
+      }
+      if (storedState.accountHash === expectedAccountHash) {
+        pin = candidate
+        state = storedState
+        break
+      }
+      openedDifferentAccount = true
+    }
+    if (!state && !openedDifferentAccount) {
+      throw new InvalidPreferencesError(LEGACY_PIN_RECOVERY_ERROR)
+    }
+    if (state && (activePinEntry?.accountHash !== expectedAccountHash || activePinEntry.pin !== pin)) {
+      ZenMoney.setData(DEVICE_PIN_DATA_KEY, {
+        version: DEVICE_PIN_DATA_VERSION,
+        active: { accountHash: expectedAccountHash, pin },
+        pending: pendingPinEntry?.accountHash === expectedAccountHash ? null : pendingPinEntry
+      })
+      ZenMoney.saveData()
+    }
+  }
+
+  if (!state) {
+    if (pendingPinForCurrentAccount) {
+      pin = pendingPinEntry.pin
+    } else if (!storedEnvelope && activePinEntry?.accountHash === expectedAccountHash) {
+      pin = activePinEntry.pin
+    }
+    if (!pin) {
+      pin = generateDevicePin()
+    }
+    if (!pendingPinForCurrentAccount) {
+      ZenMoney.setData(DEVICE_PIN_DATA_KEY, {
+        version: DEVICE_PIN_DATA_VERSION,
+        active: activePinEntry,
+        pending: { accountHash: expectedAccountHash, pin }
+      })
+      ZenMoney.saveData()
+    }
+    const sid = await login(preferences.login, preferences.password)
+    console.log('>>> Регистрация устройства для выписок BGPB...')
+    const identity = createDeviceIdentity()
+    const nonce = String(Date.now())
+    const registration = await registerDeviceToken(sid, identity, nonce)
+    let activationPassword = registration.activationPassword.trim()
+    if (activationPassword.length !== 8) {
+      activationPassword = await readActivationCode()
+    }
+    const descriptor = buildActivationDescriptor({
+      xfad: registration.xfad,
+      activationPassword,
+      nonce,
+      pin,
+      identity
+    })
+    const activationSid = await login(preferences.login, preferences.password)
+    await activateDeviceToken(activationSid, registration.deviceNo, descriptor.derivationOtp)
+    state = createDeviceState({
+      login: preferences.login,
+      deviceNo: registration.deviceNo,
+      otpKey: descriptor.otpKey,
+      identity
+    })
+    ZenMoney.setData(DEVICE_TOKEN_DATA_KEY, sealDeviceState(state, pin))
+    ZenMoney.setData(DEVICE_PIN_DATA_KEY, {
+      version: DEVICE_PIN_DATA_VERSION,
+      active: { accountHash: expectedAccountHash, pin },
+      pending: null
+    })
+    ZenMoney.saveData()
+    console.log('>>> Устройство BGPB активировано.')
+    try {
+      await logoff(activationSid)
+    } catch (_error) {
+      console.log('>>> Не удалось закрыть парольную сессию BGPB после активации.')
+    }
+    return await openDeviceSession(state, pin, true)
+  }
+
+  return await openDeviceSession(state, pin, false)
+}
+
+async function waitForNextDeviceOtpPeriod () {
+  const now = Date.now()
+  const nextPeriod = (Math.floor(now / DEVICE_OTP_PERIOD_MS) + 1) * DEVICE_OTP_PERIOD_MS
+  await new Promise(resolve => setTimeout(resolve, nextPeriod - now + DEVICE_OTP_BOUNDARY_GRACE_MS))
+}
+
+/**
+ * Provides one fresh OTP for protected actions without reusing the code that
+ * opened the device session.
+ */
+export function createDeviceAuthorizationProvider (state, pin, initialOtp, options = {}) {
+  const generateOtp = options.generateOtp || generateDeviceOtp
+  const waitForNextOtpPeriod = options.waitForNextOtpPeriod || waitForNextDeviceOtpPeriod
+  let cachedAuthorization = null
+  let authorizationPromise = null
+
+  return () => {
+    if (authorizationPromise) {
+      return authorizationPromise
+    }
+
+    const currentOtp = generateOtp(state, pin)
+    if (cachedAuthorization && cachedAuthorization.otp === currentOtp) {
+      return Promise.resolve(cachedAuthorization)
+    }
+
+    const nextAuthorizationPromise = (async () => {
+      let otp = currentOtp
+      let waits = 0
+      while (otp === initialOtp) {
+        if (waits >= DEVICE_OTP_MAX_WAITS) {
+          throw new InvalidPreferencesError('Не удалось получить свежий PIN-код BGPB. Проверьте время на устройстве.')
+        }
+        await waitForNextOtpPeriod()
+        waits += 1
+        otp = generateOtp(state, pin)
+      }
+      cachedAuthorization = { deviceNo: state.deviceNo, otp }
+      return cachedAuthorization
+    })()
+
+    authorizationPromise = nextAuthorizationPromise
+    nextAuthorizationPromise.then(
+      () => {
+        if (authorizationPromise === nextAuthorizationPromise) authorizationPromise = null
+      },
+      () => {
+        if (authorizationPromise === nextAuthorizationPromise) authorizationPromise = null
+      }
+    )
+    return nextAuthorizationPromise
+  }
+}
+
+async function openDeviceSession (state, pin, activated) {
+  const loginOtp = generateDeviceOtp(state, pin)
+  const sid = await loginDeviceToken(state.deviceNo, loginOtp)
+
+  return {
+    sid,
+    activated,
+    deviceBound: true,
+    getDeviceAuthorization: createDeviceAuthorizationProvider(state, pin, loginOtp)
   }
 }
 
@@ -65,18 +308,16 @@ async function allAccounts (token) {
     .map(convertAccount)
     .filter(account => account !== null)
   for (let i = 0; i < accounts.length; i++) {
-    accounts[i].balance = await fetchBalance(token, accounts[i])
-    if (accounts[i].balance === null) {
-      continue
+    if (accounts[i].productType !== 'DEPOSIT') {
+      accounts[i].balance = await fetchBalance(token, accounts[i])
+      if (accounts[i].balance === null) {
+        continue
+      }
     }
-    const accIDs = await fetchTransactionsAccId(token, accounts[i])
-    accounts[i].transactionsAccId = accIDs.transactionsAccId
-    accounts[i].conditionsAccId = accIDs.conditionsAccId
-  }
-
-  for (let i = 0; i < accounts.length; i++) {
-    if (accounts[i].balance !== null && accounts[i].conditionsAccId !== null) {
-      accounts[i].accountID = await fetchAccountConditions(token, accounts[i])
+    if (!accounts[i].transactionsAccId || !accounts[i].conditionsAccId) {
+      const accIDs = await fetchTransactionsAccId(token, accounts[i])
+      accounts[i].transactionsAccId = accounts[i].transactionsAccId || accIDs.transactionsAccId
+      accounts[i].conditionsAccId = accounts[i].conditionsAccId || accIDs.conditionsAccId
     }
   }
 

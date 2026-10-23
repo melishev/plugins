@@ -13,7 +13,7 @@ import {
 } from './converters'
 
 const baseUrl = 'https://mobile.apelsin.uz/api'
-const appVersion = 'Av2.3.0'
+const appVersion = 'Av2.50.0'
 const userAgent = 'okhttp/5.0.0-alpha.14'
 const deviceName = 'ZenMoney'
 
@@ -477,8 +477,8 @@ export async function getAccountsTransactions (accounts, fromDate, toDate) {
     if (!ZenMoney.isAccountSkipped(account.id)) {
       const endpoint = '/account/statement?' +
         'id=' + account.id + '&' +
-        'startDate=' + fromDate + '&' +
-        'endDate=' + toDate
+        'dateFrom=' + fromDate + '&' +
+        'dateTo=' + toDate
 
       const response = await fetchJson(baseUrl + endpoint, {
         method: 'GET',

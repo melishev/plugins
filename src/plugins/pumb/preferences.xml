@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PreferenceScreen>
+    <EditTextPreference
+        key="login"
+        inputType="phone"
+        title="Номер телефону"
+        dialogTitle="Номер телефону"
+        dialogMessage="Формат: 380501234567"
+        positiveButtonText="ОК"
+        negativeButtonText="Скасувати"
+        summary="|Приклад: 380501234567|{@s}"
+        obligatory="true">
+    </EditTextPreference>
+    <EditTextPreference
+        key="password"
+        title="PIN-код застосунку ПУМБ"
+        dialogTitle="PIN-код застосунку ПУМБ"
+        dialogMessage="Введіть PIN-код, який використовується для входу в застосунок ПУМБ. Застосунок банку для синхронізації не потрібен."
+        positiveButtonText="ОК"
+        negativeButtonText="Скасувати"
+        inputType="textPassword"
+        summary="||***********"
+        obligatory="true">
+    </EditTextPreference>
+    <EditTextPreference
+        key="startDate"
+        title="З якої дати завантажувати операції"
+        dialogTitle="З якої дати завантажувати операції"
+        positiveButtonText="ОК"
+        negativeButtonText="Скасувати"
+        inputType="date"
+        summary="|рррр-мм-дд|{@s}"
+        obligatory="true">
+    </EditTextPreference>
+</PreferenceScreen>

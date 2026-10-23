@@ -108,10 +108,17 @@ export interface AuthInitiatePayload {
   channel: number
   deviceId: string | null
   refreshToken: string | null
-  loggedInWith: number
+  loggedInWith: number | string
   deviceName: string
   languageType: string // LanguageType capitalized
   WebDevicePublicId?: string
+  deviceOs?: string
+  deviceOsVersion?: string
+  deviceScreenSize?: string
+  userAgent?: string
+  deviceType?: string
+  deviceModel?: string
+  deviceLanguage?: string
 }
 
 export interface AuthResponse {
@@ -300,7 +307,8 @@ export enum TransactionType {
 export enum OperationType {
   ConversionRu = 'Безналичная конвертация',
   ConversionKa = 'უნაღდო კონვერტაცია',
-  ConversionEn = 'Currency conversion'
+  ConversionEn = 'Currency conversion',
+  ExchangeEn = 'Currency exchange'
 }
 
 // Отображение транзакции для пользователя. Меняется при смене языка
@@ -316,6 +324,7 @@ export enum OperationType {
 export interface Transaction {
   credit: number | null
   currency: string // USD, INR, RUB, EUR, ...
+  operationId?: string | null
   transactionType: TransactionType | null //  can be null on Accrued interest payment
   transactionId: string // on blocked transaction differs from all others
   debit: number | null
@@ -326,8 +335,10 @@ export interface Transaction {
   canRepeat: boolean
   canReverse: boolean
   amountEquivalent: number
-  operationType: OperationType
+  operationType: OperationType | string
   operationTypeId: null
+  transactionTypeId?: number | null
+  transactionTypeName?: string | null
 }
 
 export interface TransactionListResponse {

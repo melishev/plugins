@@ -1,41 +1,49 @@
-import { getOptString } from '../types/get'
+import get, { getOptString } from '../types/get'
 import type { FetchFunc } from '../common/network'
 import { makeFetchCookie } from '../common/cookie/fetchCookie'
-import { Cookie, CookieJar } from 'tough-cookie'
+import { Cookie, CookieJar as ToughCookieJar } from 'tough-cookie'
+import { setClientPfx, addTrustedCertificates, withDefaultTls } from '../common/network/tls'
 
 const ZenMoney = global.ZenMoney as any
 
 const _fetch: FetchFunc = ZenMoney.fetch as FetchFunc
-const _fetchCookie = makeFetchCookie(_fetch)
+const cookieJar = new ToughCookieJar()
+const _fetchCookie = makeFetchCookie(_fetch, cookieJar)
 const _fetchWithoutCookies = makeFetchCookie(_fetch, {
   getCookieString: async () => '',
   setCookie: async () => {}
 })
 const _restoreCookies = ZenMoney.restoreCookies.bind(ZenMoney)
 const _saveCookies = ZenMoney.saveCookies.bind(ZenMoney)
+const _openWebView = ZenMoney.openWebView.bind(ZenMoney)
 
-const cookieJar = _fetchCookie.cookieJar as CookieJar
 const cookieStore = cookieJar.store
 
-const clientPfxs: Record<string, Uint8Array> = {}
-const trustedCertificates: string[] = []
+delete ZenMoney.Headers.prototype.getAll
 
 global.Headers = ZenMoney.Headers
 global.fetch = function (url?: unknown, options?: unknown): any {
   options = typeof url !== 'string' && url != null ? url : options
+  const headers = new ZenMoney.Headers(get(options, 'headers') ?? {})
   options = {
-    ...(options as Record<string, unknown> ?? {}),
-    tls: {
-      ca: [...trustedCertificates],
-      pfx: Object.values(clientPfxs)
-    }
+    ...withDefaultTls(options),
+    headers
   }
   url = getOptString(options, 'url') ?? url
+  const cookie = headers.get('cookie')
   const impl: Function = getOptString(options, 'cookies') === 'omit' || getOptString(options, 'credentials') === 'omit'
     ? _fetchWithoutCookies
-    : _fetchCookie
+    : cookie == null
+      ? _fetchCookie
+      : makeFetchCookie(_fetch, {
+        getCookieString: async () => '',
+        setCookie: async function () {
+          return await cookieJar.setCookie.apply(cookieJar, arguments as any)
+        }
+      })
   return impl.call(this, url, options)
 }
+Object.defineProperty(global.fetch, 'cookieJar', { value: cookieJar })
 
 async function getCookie (
   name: string,
@@ -67,25 +75,18 @@ async function getCookies (): Promise<Array<{
 
 async function restoreCookies (): Promise<void> {
   await _restoreCookies()
-  const cookieJsonArray = ZenMoney.__cookies as Array<Record<string, unknown>> | null | undefined
-  if (cookieJsonArray == null || !Array.isArray(cookieJsonArray) || cookieJsonArray.length <= 0) {
-    await cookieStore.removeAllCookies()
-    return
-  }
-  for (const cookieJson of cookieJsonArray) {
-    try {
-      const cookie = Cookie.fromJSON(({
-        key: cookieJson.name,
-        ...cookieJson
-      }))
-      if (cookie != null) {
-        await cookieStore.putCookie(cookie)
-        continue
-      }
-      console.warn('Failed to restore cookie:', cookieJson)
-    } catch (err) {
-      console.warn('Failed to restore cookie:', cookieJson, err)
-    }
+  const snapshot: unknown = ZenMoney.__cookies ?? []
+  if (!Array.isArray(snapshot)) throw new Error('Invalid cookie snapshot')
+  const cookies = snapshot.map((entry: unknown) => {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('Invalid stored cookie')
+    const cookie = Cookie.fromJSON({ key: get(entry, 'name'), ...entry })
+    if (cookie == null || cookie.domain == null || cookie.path == null) throw new Error('Invalid stored cookie')
+    return cookie
+  })
+  // Validate the entire snapshot before replacing working cookies; never log cookie values.
+  await cookieStore.removeAllCookies()
+  for (const cookie of cookies) {
+    await cookieStore.putCookie(cookie)
   }
 }
 
@@ -121,16 +122,8 @@ async function setCookie (
   await cookieJar.setCookie(cookie, url)
 }
 
-async function setClientPfx (pfx: Uint8Array | null, domain: string): Promise<void> {
-  if (pfx == null) {
-    delete clientPfxs[domain]
-  } else {
-    clientPfxs[domain] = pfx
-  }
-}
-
-async function trustCertificates (certs: string[]): Promise<void> {
-  trustedCertificates.push(...certs)
+function openWebView (url: unknown, headers: unknown, intercept: unknown, callback: unknown, options?: Record<string, unknown>) {
+  return _openWebView(url, headers, intercept, callback, withDefaultTls(options))
 }
 
 Object.assign(
@@ -142,6 +135,7 @@ Object.assign(
     saveCookies,
     setClientPfx,
     setCookie,
-    trustCertificates
+    openWebView,
+    trustCertificates: addTrustedCertificates
   }
 )

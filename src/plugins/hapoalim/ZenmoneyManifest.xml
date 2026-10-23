@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<provider>
+    <id>hapoalim</id>
+    <company>15700</company>
+    <codeRequired>false</codeRequired>
+    <description>Uses the official Bank Hapoalim web login flow and reuses the authenticated bank session for sync.</description>
+</provider>

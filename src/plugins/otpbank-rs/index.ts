@@ -1,6 +1,7 @@
-import { Account, ScrapeFunc, Transaction } from '../../types/zenmoney'
-import { fetchAccounts, fetchTransactions, login } from './api'
-import { convertAccounts, convertTransaction } from './converters'
+import { Account, ExtendedTransaction, ScrapeFunc } from '../../types/zenmoney'
+import { adjustTransactions } from '../../common/transactionGroupHandler'
+import { fetchAccounts, fetchCards, fetchTransactions, login } from './api'
+import { convertAccounts, convertCards, convertTransaction, mergeTransactionsByMovementId } from './converters'
 import { Currency } from './helpers'
 import { Auth, Preferences } from './models'
 
@@ -11,21 +12,27 @@ export const scrape: ScrapeFunc<Preferences> = async ({ preferences, fromDate, t
   ZenMoney.saveData()
 
   const accounts: Account[] = []
-  const transactions: Transaction[] = []
-  await Promise.all(convertAccounts(await fetchAccounts(session)).map(async ({ account, products }) => {
+  const transactions: ExtendedTransaction[] = []
+  const convertedProducts = [
+    ...convertAccounts(await fetchAccounts(session)),
+    ...convertCards(await fetchCards(session))
+  ]
+  const allAccounts = convertedProducts.map(({ account }) => account)
+
+  await Promise.all(convertedProducts.map(async ({ account, products }) => {
     accounts.push(account)
     if (ZenMoney.isAccountSkipped(account.id)) {
       return
     }
     await Promise.all(products.map(async product => {
-      const apiTransactions = await fetchTransactions(session, product.id, account.instrument as keyof typeof Currency, fromDate, toDate ?? new Date())
+      const apiTransactions = await fetchTransactions(session, product, account.instrument as keyof typeof Currency, fromDate, toDate ?? new Date())
       for (const apiTransaction of apiTransactions) {
-        transactions.push(convertTransaction(apiTransaction, account))
+        transactions.push(convertTransaction(apiTransaction, account, allAccounts))
       }
     }))
   }))
   return {
     accounts,
-    transactions
+    transactions: adjustTransactions({ transactions: mergeTransactionsByMovementId(transactions) })
   }
 }
